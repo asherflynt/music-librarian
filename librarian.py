@@ -420,7 +420,16 @@ def navidrome_album_exists(user, pw, artist, album):
 # YouTube Music (Google Takeout) — external cold-start taste signal
 # ----------------------------------------------------------------------------
 def youtube_music_weights():
-    """Parse Takeout watch-history JSON files; tally listen frequency by artist."""
+    """Parse Takeout watch-history JSON files; tally listen frequency by artist.
+
+    Verified against real Takeout data (2026-07). Notes for future editors:
+      - `header` ("YouTube Music" vs "YouTube") + the music.youtube.com URL are the
+        ONLY reliable music signals. Do NOT filter on `products`: real exports set
+        it to ["YouTube"] on every entry, music or not, so it matches nothing.
+      - YT Music artist channels are named "<Artist> - Topic"; strip that suffix.
+      - Music watched on regular youtube.com is indistinguishable from any other
+        video and is intentionally not counted.
+    """
     weights = {}
     if not TAKEOUT_DIR.exists():
         return weights
