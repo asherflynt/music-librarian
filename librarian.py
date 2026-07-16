@@ -43,6 +43,10 @@ TARGET_FOLDER = os.environ.get("TARGET_FOLDER", "/music")           # beets dest
 
 LOSSY_EXTS = {"mp3", "m4a", "aac"}
 LOSSY_MIN_SCORE = float(os.environ.get("LOSSY_MIN_SCORE", "0.55"))  # ~clean 320 kbps MP3
+# .m4a is ambiguous: ALAC (lossless) and AAC (lossy) share the extension, and the
+# backend only reports the extension. Bitrate is the discriminator -- ALAC runs
+# ~600-900 kbps, AAC caps ~320. Anything at/above this is treated as ALAC.
+ALAC_MIN_KBPS = float(os.environ.get("ALAC_MIN_KBPS", "500"))
 KIDS_TAGS = {"children's music", "childrens music", "children", "nursery",
              "nursery rhymes", "kids", "kids music", "lullaby", "lullabies"}
 AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus"}
@@ -127,7 +131,9 @@ def db_connect():
         CREATE TABLE IF NOT EXISTS candidates (
             key TEXT PRIMARY KEY,       -- normalized 'artist|album' or 'artist|track'
             artist TEXT, album TEXT, kind TEXT,
-            status TEXT DEFAULT 'pending',   -- pending|queued_flac|queued_lossy|no_source|low_quality_only|no_meta|error|exists
+            status TEXT DEFAULT 'pending',   -- pending|queued_flac|queued_alac|queued_lossy|no_source|low_quality_only|no_meta|error|exists
+            fmt TEXT,                   -- actual format chosen: flac|alac|mp3|m4a|aac
+            kbps INTEGER,               -- measured bitrate of what was queued
             updated_at INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -193,11 +199,20 @@ class State:
             ).fetchall()
         return rows
 
-    def set_status(self, key, status):
+    def set_status(self, key, status, fmt=None, kbps=None):
         with self.lock:
-            self.conn.execute("UPDATE candidates SET status=?, updated_at=? WHERE key=?",
-                              (status, int(time.time()), key))
+            self.conn.execute(
+                "UPDATE candidates SET status=?, fmt=?, kbps=?, updated_at=? WHERE key=?",
+                (status, fmt, kbps, int(time.time()), key))
             self.conn.commit()
+
+    def fallbacks(self, limit=25):
+        """Recent non-FLAC acquisitions, so it's always visible what fell back."""
+        with self.lock:
+            return self.conn.execute(
+                "SELECT artist, album, status, fmt, kbps FROM candidates "
+                "WHERE status IN ('queued_alac','queued_lossy') "
+                "ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
 
     def status_counts(self):
         with self.lock:
@@ -274,18 +289,56 @@ class Soulbeet:
                           {"req": {"items": items, "target_folder": TARGET_FOLDER, "backend": None}})
 
 
-def pick_by_quality_ladder(groups):
-    """Return (status, items). FLAC preferred, then high-quality lossy, else skip reason."""
-    if not groups:
-        return "no_source", []
+def est_kbps(item):
+    """Effective bitrate from size/duration. The backend only tells us the file
+    EXTENSION, not the codec -- and .m4a is used by both ALAC (lossless) and AAC
+    (lossy). Bitrate is what actually separates them: ALAC lands ~600-900 kbps,
+    AAC caps around 320."""
+    size = item.get("size") or 0
+    dur = item.get("duration") or 0
+    if size > 0 and dur > 0:
+        return (size * 8) / dur / 1000
+    return 0.0
 
+
+def group_kbps(g):
+    vals = [k for k in (est_kbps(it) for it in g.get("items", [])) if k > 0]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def pick_by_quality_ladder(groups):
+    """Return (status, items, info). Quality ladder, best first:
+
+      1. FLAC                       -> lossless
+      2. ALAC (.m4a at >= ALAC_MIN_KBPS) -> also lossless, so ranked with FLAC
+      3. high-quality lossy (mp3/aac/.m4a-aac) at >= LOSSY_MIN_SCORE
+      else: low_quality_only / no_source
+
+    'info' carries the chosen format + measured bitrate so callers can log and
+    record exactly what a fallback landed on.
+    """
+    if not groups:
+        return "no_source", [], None
+
+    # --- tier 1: FLAC ---
     flac = [g for g in groups if g.get("quality") == "flac"]
     if flac:
         flac.sort(key=lambda g: (g.get("score", 0), g.get("item_count", 0)), reverse=True)
         items = [it for it in flac[0].get("items", []) if it.get("quality") == "flac"]
         if items:
-            return "queued_flac", items
+            return "queued_flac", items, {"fmt": "flac", "kbps": round(group_kbps(flac[0]))}
 
+    # --- tier 2: ALAC (.m4a at lossless bitrate) -- lossless, so preferred over any lossy ---
+    alac = [g for g in groups
+            if g.get("quality") == "m4a" and group_kbps(g) >= ALAC_MIN_KBPS]
+    if alac:
+        alac.sort(key=lambda g: (g.get("score", 0), g.get("item_count", 0)), reverse=True)
+        items = [it for it in alac[0].get("items", [])
+                 if it.get("quality") == "m4a" and est_kbps(it) >= ALAC_MIN_KBPS]
+        if items:
+            return "queued_alac", items, {"fmt": "alac", "kbps": round(group_kbps(alac[0]))}
+
+    # --- tier 3: high-quality lossy ---
     lossy = [g for g in groups if g.get("quality") in LOSSY_EXTS]
     if lossy:
         lossy.sort(key=lambda g: g.get("score", 0), reverse=True)
@@ -298,10 +351,11 @@ def pick_by_quality_ladder(groups):
                 1 if re.search(r"320|v0", (it.get("title", "") or "").lower()) else 0,
                 it.get("quality_score", 0)), reverse=True)
             if items:
-                return "queued_lossy", items
-        return "low_quality_only", []
+                return "queued_lossy", items, {"fmt": g.get("quality"),
+                                               "kbps": round(group_kbps(g))}
+        return "low_quality_only", [], None
 
-    return "low_quality_only" if groups else "no_source", []
+    return "low_quality_only", [], None
 
 
 # ----------------------------------------------------------------------------
@@ -570,10 +624,22 @@ def process_candidate(state, sb, secrets, row):
 
         sid = sb.start_search(album_obj, tracks)
         res = sb.poll(sid)
-        status, items = pick_by_quality_ladder(res.get("groups", []))
+        status, items, info = pick_by_quality_ladder(res.get("groups", []))
         if items:
             sb.queue(items)
-        state.set_status(key, status)
+
+        # Document every non-FLAC outcome explicitly: what it fell back to and why.
+        if info and status == "queued_alac":
+            log(f"  FALLBACK [{artist} - {album}]: no FLAC source -> ALAC "
+                f"(.m4a @ ~{info['kbps']} kbps, lossless)")
+        elif info and status == "queued_lossy":
+            log(f"  FALLBACK [{artist} - {album}]: no lossless source -> "
+                f"{info['fmt']} @ ~{info['kbps']} kbps (lossy)")
+        elif status == "low_quality_only":
+            log(f"  SKIPPED [{artist} - {album}]: only sub-threshold lossy sources")
+
+        state.set_status(key, status,
+                         fmt=(info or {}).get("fmt"), kbps=(info or {}).get("kbps"))
         return status
     except Exception as e:
         log(f"  candidate error [{artist} - {album}]: {e}")
@@ -593,22 +659,36 @@ def write_status(state, cfg, lib_bytes, track_count, free):
         "pct_to_target": round(100 * max(tb / cfg["TARGET_TB"] if cfg["TARGET_TB"] else 0,
                                          track_count / cfg["TARGET_TRACKS"] if cfg["TARGET_TRACKS"] else 0), 1),
         "cluster_free_gb": round(free, 1),
+        # lossless
         "queued_flac": counts.get("queued_flac", 0),
+        "queued_alac": counts.get("queued_alac", 0),
+        # lossy fallback
         "queued_lossy": counts.get("queued_lossy", 0),
+        # skipped / other
         "no_source": counts.get("no_source", 0),
         "low_quality_only": counts.get("low_quality_only", 0),
         "no_meta": counts.get("no_meta", 0),
         "exists": counts.get("exists", 0),
         "error": counts.get("error", 0),
         "pending": counts.get("pending", 0),
+        # exactly what fell back to what, most recent first
+        "recent_fallbacks": [
+            {"artist": a, "album": b, "format": f, "kbps": k,
+             "lossless": s == "queued_alac"}
+            for (a, b, s, f, k) in state.fallbacks(25)
+        ],
     }
+    lossless = status["queued_flac"] + status["queued_alac"]
+    status["lossless_total"] = lossless
+    status["lossless_pct"] = (round(100 * lossless / (lossless + status["queued_lossy"]), 1)
+                              if (lossless + status["queued_lossy"]) else None)
     try:
         STATUS_JSON.write_text(json.dumps(status, indent=2))
     except OSError:
         pass
     log("STATUS " + json.dumps({k: status[k] for k in
         ("library_tb", "tracks", "pct_to_target", "cluster_free_gb",
-         "queued_flac", "queued_lossy", "pending")}))
+         "queued_flac", "queued_alac", "queued_lossy", "lossless_pct", "pending")}))
 
 
 def stop_reason(cfg, lib_bytes, track_count, free):

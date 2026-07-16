@@ -44,6 +44,46 @@ the library via Soulbeet/beets (which has its own writable mount).
 - **Refresh taste**: re-export YT Music history from Takeout into `takeout/`; Navidrome play counts update automatically.
 - **Exclude more kids' music**: add artists to `exclude.txt`.
 
+## Quality ladder (FLAC preferred, never required)
+
+For each album/track, best available wins:
+
+| Tier | Format | Notes |
+|---|---|---|
+| 1 | **FLAC** | lossless |
+| 2 | **ALAC** (`.m4a` ≥ `ALAC_MIN_KBPS`, default 500) | also lossless — ranked above *any* lossy source, even a higher-scoring one |
+| 3 | **High-quality lossy** (`mp3`/`aac`/`.m4a`-as-AAC) at `quality_score ≥ 0.55` (~320 kbps / V0) | 320 and V0 preferred |
+| — | skipped | `low_quality_only` (only sub-threshold lossy) or `no_source` |
+
+**The `.m4a` trap:** `.m4a` is a *container* used by both ALAC (lossless) and AAC
+(lossy), and the backend only reports the file **extension**, not the codec — so
+"prefer m4a" would silently pull lossy AAC most of the time. Bitrate is the real
+discriminator: ALAC runs ~600–900 kbps, AAC caps ~320. The librarian computes
+effective bitrate from `size`/`duration` and only calls an `.m4a` lossless if it
+clears `ALAC_MIN_KBPS`. Tune via the `ALAC_MIN_KBPS` env var.
+
+**Every fallback is documented.** When no FLAC exists, the log records what it
+landed on and why:
+
+```
+FALLBACK [Artist - Album]: no FLAC source -> ALAC (.m4a @ ~874 kbps, lossless)
+FALLBACK [Artist - Album]: no lossless source -> mp3 @ ~336 kbps (lossy)
+SKIPPED  [Artist - Album]: only sub-threshold lossy sources
+```
+
+and `status.json` carries per-item detail plus a running lossless ratio:
+
+```json
+"queued_flac": 412, "queued_alac": 9, "queued_lossy": 63,
+"lossless_total": 421, "lossless_pct": 87.0,
+"recent_fallbacks": [
+  {"artist": "...", "album": "...", "format": "mp3", "kbps": 336, "lossless": false}
+]
+```
+
+The SQLite `candidates` table keeps `fmt` + `kbps` for every acquisition, so you can
+always audit exactly what is lossless vs. fallback.
+
 ## Status
 
 `cat /mnt/user/appdata/librarian/state/status.json` or `docker logs librarian` — shows
