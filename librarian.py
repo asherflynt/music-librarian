@@ -47,11 +47,30 @@ LOSSY_MIN_SCORE = float(os.environ.get("LOSSY_MIN_SCORE", "0.55"))  # ~clean 320
 # backend only reports the extension. Bitrate is the discriminator -- ALAC runs
 # ~600-900 kbps, AAC caps ~320. Anything at/above this is treated as ALAC.
 ALAC_MIN_KBPS = float(os.environ.get("ALAC_MIN_KBPS", "500"))
-KIDS_TAGS = {"children's music", "childrens music", "children", "nursery",
-             "nursery rhymes", "kids", "kids music", "lullaby", "lullabies"}
+# Verified against real Last.fm data (2026-07): the tag Last.fm actually uses is the
+# bare "childrens" -- NOT "childrens music"/"children". That gap let Bluey (tagged
+# australian/cartoon/soundtrack/pop/childrens) through as a top-5 taste artist.
+# Deliberately NOT included: "cartoon" (would also catch Gorillaz et al) and
+# "novelty" (too broad). Artists with no kids tag at all -- Parry Gripp
+# (comedy/novelty), Ms Rachel (no tags whatsoever) -- are uncatchable by tags;
+# exclude.txt is the real defense. Last.fm tags are user-generated and troll-infested
+# (Cocomelon is tagged "goregrind"), so only the leading tags are weighed.
+KIDS_TAGS = {"childrens", "children's", "children", "childrens music",
+             "children's music", "kids", "kids music", "kids tv", "kid's music",
+             "nursery", "nursery rhyme", "nursery rhymes", "lullaby", "lullabies"}
+KIDS_TAG_DEPTH = int(os.environ.get("KIDS_TAG_DEPTH", "6"))
 AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus"}
 
 LOG_LOCK = threading.Lock()
+
+
+def scrub_secrets(msg):
+    """Strip credentials out of anything headed for the log. requests embeds the
+    full URL (api_key=..., Subsonic t=/s=/p=) in its exception messages."""
+    s = str(msg)
+    s = re.sub(r"(api_key=)[^&\s]+", r"\1[REDACTED]", s)
+    s = re.sub(r"([?&](?:t|s|p|u)=)[^&\s]+", r"\1[REDACTED]", s)
+    return s
 
 
 def log(msg):
@@ -118,7 +137,12 @@ def load_config():
 # ----------------------------------------------------------------------------
 def db_connect():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(STATE_DB, timeout=30)
+    # check_same_thread=False: candidates are processed in a ThreadPoolExecutor, so
+    # worker threads touch this connection. Every access in State is serialized by
+    # self.lock, which is what actually makes that safe. Without this flag sqlite3
+    # raises "SQLite objects created in a thread can only be used in that same
+    # thread" on every single candidate, silently failing the whole pipeline.
+    conn = sqlite3.connect(STATE_DB, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(
         """
@@ -135,6 +159,11 @@ def db_connect():
             fmt TEXT,                   -- actual format chosen: flac|alac|mp3|m4a|aac
             kbps INTEGER,               -- measured bitrate of what was queued
             updated_at INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS artist_tags (
+            name TEXT PRIMARY KEY,      -- normalized artist name
+            tags TEXT,                  -- json list of lowercase Last.fm tags
+            checked_at INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
         """
@@ -219,6 +248,22 @@ class State:
             rows = self.conn.execute(
                 "SELECT status, COUNT(*) FROM candidates GROUP BY status").fetchall()
         return dict(rows)
+
+    def get_tags(self, name):
+        """Cached Last.fm tags, or None if never successfully fetched."""
+        with self.lock:
+            r = self.conn.execute("SELECT tags FROM artist_tags WHERE name=?",
+                                  (norm(name),)).fetchone()
+        return json.loads(r[0]) if r and r[0] else None
+
+    def put_tags(self, name, tags):
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO artist_tags(name, tags, checked_at) VALUES(?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET tags=excluded.tags, "
+                "checked_at=excluded.checked_at",
+                (norm(name), json.dumps(tags), int(time.time())))
+            self.conn.commit()
 
     def get_meta(self, k, default=None):
         with self.lock:
@@ -481,7 +526,9 @@ class LastFM:
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            log(f"Last.fm {method} failed: {e}")
+            # requests puts the full request URL in the exception -- which includes
+            # api_key=... Scrub it so the key never lands in docker logs.
+            log(f"Last.fm {method} failed: {scrub_secrets(e)}")
             return {}
 
     def similar(self, artist, limit=30):
@@ -523,15 +570,25 @@ def load_exclude_set():
     return names
 
 
-def is_kids_artist(lastfm, artist, exclude_set, tag_cache):
-    if norm(artist) in exclude_set:
+def is_excluded_by_name(artist, exclude_set):
+    """Local, free, no API call. The only reliable defense for artists Last.fm
+    tags poorly or not at all (Parry Gripp, Ms Rachel)."""
+    return norm(artist) in exclude_set
+
+
+def is_kids_artist(state, lastfm, artist, exclude_set):
+    """Name blocklist first (free), then cached Last.fm tags (one API call ever,
+    persisted to SQLite so restarts don't re-query thousands of artists)."""
+    if is_excluded_by_name(artist, exclude_set):
         return True
-    if artist in tag_cache:
-        tags = tag_cache[artist]
-    else:
+    tags = state.get_tags(artist)
+    if tags is None:
         tags = lastfm.artist_tags(artist)
-        tag_cache[artist] = tags
-    return any(t in KIDS_TAGS for t in tags)
+        # Only cache successful lookups: Last.fm 500s intermittently, and caching
+        # an error as "no tags" would permanently whitelist a kids artist.
+        if tags:
+            state.put_tags(artist, tags)
+    return any(t in KIDS_TAGS for t in tags[:KIDS_TAG_DEPTH])
 
 
 # ----------------------------------------------------------------------------
@@ -563,7 +620,7 @@ def free_gb(path):
 # ----------------------------------------------------------------------------
 # Core: expand seed graph, process candidates
 # ----------------------------------------------------------------------------
-def refresh_taste(state, secrets, lastfm, exclude_set, tag_cache):
+def refresh_taste(state, secrets, lastfm, exclude_set):
     """Pull play-count weights (Navidrome + YT Music), enqueue weighted seed artists."""
     weights = {}
     for name, w in navidrome_frequent_artists(secrets["SOULBEET_USER"], secrets["SOULBEET_PASS"]).items():
@@ -574,19 +631,32 @@ def refresh_taste(state, secrets, lastfm, exclude_set, tag_cache):
     for name in navidrome_all_artists(secrets["SOULBEET_USER"], secrets["SOULBEET_PASS"]):
         weights.setdefault(name, 1.0)
 
-    added = 0
+    # Only the free local blocklist here. Tag lookups are NOT done at refresh time:
+    # doing them for every artist meant ~1900 sequential Last.fm calls (~8 min) on
+    # every refresh and again on every restart. They now happen lazily in
+    # expand_one_artist -- one call per artist we actually try to expand, cached
+    # in SQLite forever.
+    added = skipped = 0
     for name, w in weights.items():
-        if is_kids_artist(lastfm, name, exclude_set, tag_cache):
+        if is_excluded_by_name(name, exclude_set):
+            skipped += 1
             continue
         state.upsert_artist(name, weight=w)
         added += 1
-    log(f"Taste refresh: {added} weighted artists (top by play count drive expansion)")
+    log(f"Taste refresh: {added} weighted artists seeded, {skipped} blocklisted "
+        f"(top play counts drive expansion)")
     state.set_meta("last_taste_refresh", int(time.time()))
 
 
-def expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set, tag_cache):
-    """Generate album candidates for one artist: exploitation + a share of exploration."""
-    if is_kids_artist(lastfm, artist, exclude_set, tag_cache):
+def expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set):
+    """Generate album candidates for one artist: exploitation + a share of exploration.
+
+    This is where the kids filter actually bites: seeding is cheap and unfiltered
+    (beyond the name blocklist), but nothing becomes a download candidate without
+    passing the tag check here first.
+    """
+    if is_kids_artist(state, lastfm, artist, exclude_set):
+        log(f"  excluded (kids): {artist}")
         state.mark_expanded(artist)
         return 0
     new = 0
@@ -594,19 +664,18 @@ def expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set, tag_cache
     for alb in lastfm.top_albums(artist, limit=8):
         if state.add_candidate(artist, alb, "album"):
             new += 1
-    similars = lastfm.similar(artist, limit=25)
-    for sim in similars:
-        if is_kids_artist(lastfm, sim, exclude_set, tag_cache):
-            continue
-        state.upsert_artist(sim, weight=weight * 0.5)   # propagate a fraction of taste weight
+    for sim in lastfm.similar(artist, limit=25):
+        # cheap name check only; the tag check happens when sim is itself expanded
+        if not is_excluded_by_name(sim, exclude_set):
+            state.upsert_artist(sim, weight=weight * 0.5)  # propagate taste weight
 
     # exploration: from this artist's primary tags, pull artists we don't own
     if cfg["EXPLORE_RATIO"] > 0:
-        for tag in (tag_cache.get(artist) or lastfm.artist_tags(artist))[:2]:
+        for tag in (state.get_tags(artist) or [])[:2]:
             if tag in KIDS_TAGS:
                 continue
             for exp_artist in lastfm.tag_top_artists(tag, limit=int(15 * cfg["EXPLORE_RATIO"]) + 3):
-                if not is_kids_artist(lastfm, exp_artist, exclude_set, tag_cache):
+                if not is_excluded_by_name(exp_artist, exclude_set):
                     state.upsert_artist(exp_artist, weight=weight * 0.2)
     state.mark_expanded(artist)
     return new
@@ -716,7 +785,6 @@ def main():
     state = State()
     lastfm = LastFM(secrets["LASTFM_API_KEY"])
     sb = Soulbeet(secrets)
-    tag_cache = {}
 
     last_measure = 0
     lib_bytes, track_count, free = 0, 0, float("inf")
@@ -756,17 +824,17 @@ def main():
         # refresh taste signal periodically
         last_refresh = int(state.get_meta("last_taste_refresh", "0"))
         if time.time() - last_refresh > cfg["TASTE_REFRESH_MIN"] * 60:
-            refresh_taste(state, secrets, lastfm, exclude_set, tag_cache)
+            refresh_taste(state, secrets, lastfm, exclude_set)
 
         # expand a few top-weighted artists into album candidates
         for artist, weight in state.unexpanded_artists(limit=5):
-            expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set, tag_cache)
+            expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set)
 
         # process a wave of pending candidates concurrently
         batch = state.pending_candidates(limit=cfg["CONCURRENCY"] * 3)
         if not batch:
             log("No pending candidates; refreshing taste and expanding more")
-            refresh_taste(state, secrets, lastfm, exclude_set, tag_cache)
+            refresh_taste(state, secrets, lastfm, exclude_set)
             time.sleep(10)
             continue
 

@@ -25,3 +25,9 @@ Baby Einstein
 Gracie's Corner
 Jolly Kazoo
 Jolly Kazoo - Kids Songs & Nursery Rhymes
+# Seen high in the real taste signal (2026-07). Bluey IS tagged "childrens" so the
+# tag filter now catches it, but it's listed here too as belt-and-braces.
+Bluey
+# Parry Gripp is tagged only comedy/funny/geek rock/novelty -- NO kids tag at all,
+# so tags can never catch it. This line is the only thing keeping it out.
+Parry Gripp
