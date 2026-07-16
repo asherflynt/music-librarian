@@ -72,12 +72,19 @@ def _parse_env_file(path):
 
 
 def load_secrets():
-    s = _parse_env_file(SECRETS_ENV)
-    missing = [k for k in ("LASTFM_API_KEY", "SOULBEET_USER", "SOULBEET_PASS") if not s.get(k)]
-    if missing:
-        log(f"FATAL: secrets.env missing {missing}. Fill {SECRETS_ENV} and restart.")
-        sys.exit(1)
-    return s
+    """Wait patiently until secrets.env is filled, then return it. Lets the
+    container be deployed before credentials exist without crash-looping."""
+    announced = False
+    while True:
+        s = _parse_env_file(SECRETS_ENV)
+        missing = [k for k in ("LASTFM_API_KEY", "SOULBEET_USER", "SOULBEET_PASS") if not s.get(k)]
+        if not missing:
+            return s
+        if not announced:
+            log(f"Waiting for {SECRETS_ENV} — missing {missing}. "
+                f"Fill it in (no restart needed); retrying every 30s.")
+            announced = True
+        time.sleep(30)
 
 
 def load_config():
