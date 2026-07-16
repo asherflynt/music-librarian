@@ -168,8 +168,30 @@ def db_connect():
         CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
         """
     )
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn):
+    """Bring an older state.db up to the current schema.
+
+    CREATE TABLE IF NOT EXISTS does NOT alter a table that already exists, so a db
+    written by an earlier build silently lacks newer columns and every write fails
+    with "no such column". Add them idempotently instead of requiring users to
+    delete their state (which would throw away taste weights and progress).
+    """
+    def cols(table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    for table, name, decl in (
+        ("candidates", "fmt", "TEXT"),
+        ("candidates", "kbps", "INTEGER"),
+    ):
+        if name not in cols(table):
+            log(f"Migrating state.db: adding {table}.{name}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    conn.commit()
 
 
 def norm(s):
