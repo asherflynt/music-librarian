@@ -13,9 +13,7 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -42,16 +40,6 @@ MUSIC_PATH = Path(os.environ.get("MUSIC_PATH", "/music"))          # library, fo
 FREE_SPACE_PATH = os.environ.get("FREE_SPACE_PATH", "/music")       # cluster pool: library-size floor
 STAGING_PATH = os.environ.get("STAGING_PATH", "/staging")           # NVMe staging: overflow floor
 TARGET_FOLDER = os.environ.get("TARGET_FOLDER", "/music")           # beets destination in Soulbeet
-
-# Rescue sweep: Soulbeet's own DownloadMonitor doesn't reliably trigger a beets
-# import for every completed download when many groups are queued concurrently
-# (observed: fully-downloaded folders sitting in slskd's staging dir with zero
-# import attempts). This sweep re-runs `beet import` directly against that
-# staging dir on a schedule, using the exact same CLI invocation Soulbeet uses
-# internally, so anything it silently missed still lands in the library.
-SLSKD_DOWNLOADS_PATH = Path(os.environ.get("SLSKD_DOWNLOADS_PATH", "/downloads"))
-BEETS_CONFIG_PATH = os.environ.get("BEETS_CONFIG_PATH", "/soulbeet-config/config.yaml")
-RESCUE_AUDIO_EXTS = {"flac", "mp3", "m4a", "wav", "ogg"}
 
 LOSSY_EXTS = {"mp3", "m4a", "aac"}
 LOSSY_MIN_SCORE = float(os.environ.get("LOSSY_MIN_SCORE", "0.55"))  # ~clean 320 kbps MP3
@@ -117,7 +105,6 @@ def load_config():
         "CONCURRENCY": max(1, num("CONCURRENCY", 3, int)),
         "TASTE_REFRESH_MIN": num("TASTE_REFRESH_MIN", 360, int),   # re-pull play counts every 6h
         "MEASURE_EVERY_SEC": num("MEASURE_EVERY_SEC", 300, int),
-        "RESCUE_SWEEP_EVERY_MIN": num("RESCUE_SWEEP_EVERY_MIN", 20, int),
         "PAUSED": c.get("PAUSED", "0") in ("1", "true", "yes"),
     }
 
@@ -315,85 +302,6 @@ def pick_by_quality_ladder(groups):
         return "low_quality_only", []
 
     return "low_quality_only" if groups else "no_source", []
-
-
-# ----------------------------------------------------------------------------
-# Rescue sweep — catch downloads Soulbeet's own monitor never imported
-#
-# Soulbeet spawns a DownloadMonitor task per queued download that watches slskd
-# until every file finishes, then triggers `beet import`. Under this librarian's
-# sustained concurrent load, some of those monitor tasks never reach that point
-# (observed directly: fully-downloaded albums sitting in slskd's staging dir with
-# zero import attempts logged). Beets itself is not at fault — every time it *is*
-# invoked it behaves correctly. This sweep periodically re-runs the exact same
-# `beet import` command Soulbeet uses internally against the whole staging dir,
-# so anything its monitor missed still gets picked up. Safe to run repeatedly:
-# beets recognizes anything already in the library and skips it near-instantly.
-# ----------------------------------------------------------------------------
-def _audio_file_count(folder):
-    count = 0
-    for _root, _dirs, files in os.walk(folder):
-        for f in files:
-            ext = f.rsplit(".", 1)[-1].lower() if "." in f else ""
-            if ext in RESCUE_AUDIO_EXTS:
-                count += 1
-    return count
-
-
-def rescue_sweep():
-    """Re-import anything sitting complete-but-unimported in slskd's staging dir."""
-    if not SLSKD_DOWNLOADS_PATH.is_dir():
-        log(f"Rescue sweep: {SLSKD_DOWNLOADS_PATH} not mounted, skipping")
-        return
-    if not Path(BEETS_CONFIG_PATH).is_file():
-        log(f"Rescue sweep: beets config not found at {BEETS_CONFIG_PATH}, skipping")
-        return
-    if not shutil.which("beet"):
-        log("Rescue sweep: 'beet' not on PATH, skipping")
-        return
-
-    folders = sorted(p for p in SLSKD_DOWNLOADS_PATH.iterdir() if p.is_dir())
-    if not folders:
-        return
-
-    log(f"Rescue sweep: checking {len(folders)} staging folder(s)")
-    imported, skipped, empty, failed = 0, 0, 0, 0
-    library_db = f"{TARGET_FOLDER}/.beets_library.db"
-
-    # Sequential, not concurrent: beets locks its library db per-target, and
-    # concurrent `beet import` against the same db races schema creation.
-    for folder in folders:
-        count = _audio_file_count(folder)
-        if count == 0:
-            empty += 1
-            continue
-
-        cmd = ["beet", "-c", BEETS_CONFIG_PATH, "-l", library_db,
-               "-d", TARGET_FOLDER, "import", "-q"]
-        if count == 1:
-            cmd.append("-s")
-        cmd.append(str(folder))
-
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            out = (r.stdout or "") + (r.stderr or "")
-            if "already in the library" in out or "Skipping" in out:
-                skipped += 1
-            elif r.returncode == 0:
-                imported += 1
-            else:
-                failed += 1
-                log(f"  rescue import failed [{folder.name}]: {out.strip()[-300:]}")
-        except subprocess.TimeoutExpired:
-            failed += 1
-            log(f"  rescue import timed out [{folder.name}]")
-        except Exception as e:
-            failed += 1
-            log(f"  rescue import error [{folder.name}]: {e}")
-
-    log(f"Rescue sweep done: {imported} imported, {skipped} already-present, "
-        f"{empty} empty, {failed} failed (of {len(folders)} folders)")
-    return {"imported": imported, "skipped": skipped, "empty": empty, "failed": failed}
 
 
 # ----------------------------------------------------------------------------
@@ -676,7 +584,6 @@ def process_candidate(state, sb, secrets, row):
 def write_status(state, cfg, lib_bytes, track_count, free):
     counts = state.status_counts()
     tb = lib_bytes / (1024 ** 4)
-    last_rescue_at = int(state.get_meta("last_rescue_sweep", "0"))
     status = {
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "library_tb": round(tb, 3),
@@ -694,9 +601,6 @@ def write_status(state, cfg, lib_bytes, track_count, free):
         "exists": counts.get("exists", 0),
         "error": counts.get("error", 0),
         "pending": counts.get("pending", 0),
-        "last_rescue_sweep": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_rescue_at))
-                              if last_rescue_at else None),
-        "last_rescue_counts": json.loads(state.get_meta("last_rescue_counts", "null") or "null"),
     }
     try:
         STATUS_JSON.write_text(json.dumps(status, indent=2))
@@ -726,21 +630,11 @@ def main():
     tag_cache = {}
 
     last_measure = 0
-    last_rescue = 0
     lib_bytes, track_count, free = 0, 0, float("inf")
 
     while True:
         cfg = load_config()
         exclude_set = load_exclude_set()
-
-        # runs regardless of PAUSED/stop-condition state: it only imports what
-        # has already downloaded, it never starts new downloads.
-        if time.time() - last_rescue > cfg["RESCUE_SWEEP_EVERY_MIN"] * 60:
-            counts = rescue_sweep()
-            last_rescue = time.time()
-            state.set_meta("last_rescue_sweep", int(last_rescue))
-            if counts:
-                state.set_meta("last_rescue_counts", json.dumps(counts))
 
         if cfg["PAUSED"]:
             log("PAUSED via config.env; sleeping 60s")
