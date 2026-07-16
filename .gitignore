@@ -1,0 +1,10 @@
+# Never commit real secrets or runtime state
+secrets.env
+*.db
+*.db-wal
+*.db-shm
+state/
+takeout/
+status.json
+__pycache__/
+*.pyc

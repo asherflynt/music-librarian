@@ -1,0 +1,25 @@
+# Kids' music artist blocklist — one artist per line (case-insensitive).
+# These artists (and any Last.fm-tagged children's/nursery/kids acts) are
+# dropped from expansion AND stripped from the taste signal, so your kids'
+# listening never skews recommendations. Edit anytime; re-read each loop.
+Little Angel
+Cocomelon
+CoComelon Nursery Rhymes
+Blippi
+Super Simple Songs
+Pinkfong
+Baby Shark
+The Wiggles
+Sesame Street
+Ms Rachel
+Songs for Littles
+Little Baby Bum
+ChuChu TV
+Bounce Patrol
+Dave and Ava
+Mother Goose Club
+Kidz Bop
+Kidz Bop Kids
+Raffi
+Baby Einstein
+Gracie's Corner
