@@ -3,7 +3,7 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-RUN pip install --no-cache-dir requests==2.32.3
+RUN pip install --no-cache-dir requests==2.32.3 beets==2.11.0
 
 COPY librarian.py /app/librarian.py
 
