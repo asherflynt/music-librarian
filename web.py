@@ -53,6 +53,201 @@ SETTINGS = {
     "UPGRADE_ONLY_WHEN_IDLE":   ("bool", 0, 1),
 }
 
+# Plain-English explanation of every setting, shown as a hover box in the UI.
+#   name:    (short line under the field, one-liner)
+#   detail:  what it actually does, in plain English, and what happens if you change
+#            it. This is the only place these are written down; README.md's settings
+#            table is generated from this dict by tools/gen_settings_doc.py, so the
+#            docs cannot drift from the UI.
+HELP = {
+    "TARGET_TB": (
+        "Stop once the library reaches this size",
+        "The size you want your music library to grow to, in terabytes. The librarian "
+        "keeps downloading until the library hits this OR the track count target, "
+        "whichever comes first, then idles.\n\n"
+        "Raise it and it picks straight back up where it left off — nothing is lost or "
+        "re-downloaded. Lower it below your current size and it stops cleanly; it never "
+        "deletes anything to get back under the number.\n\n"
+        "This is the one to change when you clear space and want more music."),
+    "TARGET_TRACKS": (
+        "…or once it reaches this many tracks",
+        "The other finish line: stop once the library holds this many tracks. Whichever "
+        "target is hit first wins.\n\n"
+        "In practice size is almost always the binding limit — 100,000 FLAC tracks would "
+        "be far more than 3 TB — so treat this as a safety ceiling rather than the "
+        "real goal."),
+    "EXPLORE_RATIO": (
+        "0 = only what you love · 1 = only new horizons",
+        "How adventurous the recommendations are.\n\n"
+        "At 0 the librarian only fetches more of what you already play and artists that "
+        "sound like them. At 1 it only chases artists you don't own from genres you lean "
+        "into. The default 0.3 spends about 70% of its effort deepening your existing "
+        "taste and 30% stretching it.\n\n"
+        "Turn it down if you're getting music you don't recognise; turn it up if the "
+        "library feels like an echo chamber."),
+    "MIN_FREE_GB": (
+        "Hard floor — never fill the pool below this",
+        "A safety net for your storage pool. If free space on the cluster pool drops "
+        "below this many gigabytes, the librarian stops adding music entirely, no "
+        "matter what the targets say.\n\n"
+        "This exists so a runaway fill can't fill the pool that also holds your movies, "
+        "TV, and everything else. Don't set it near zero — a full ZFS pool performs "
+        "badly and is unpleasant to dig out of."),
+    "STAGING_MIN_FREE_GB": (
+        "Pause if the NVMe staging pool gets this low",
+        "Downloads land on the fast NVMe cache first, then beets imports them into the "
+        "library. If that cache drops below this many gigabytes free, the librarian "
+        "pauses new downloads for a couple of minutes to let imports drain it.\n\n"
+        "It protects the cache SSD from filling up mid-transfer, which would stall "
+        "every download at once."),
+    "CONCURRENCY": (
+        "How many albums to download at once",
+        "How many albums the librarian works on simultaneously.\n\n"
+        "Higher isn't better: Soulseek peers are ordinary people's computers, and "
+        "hammering several at once gets you queued, throttled, or banned. 3–4 is the "
+        "sweet spot. Raise it only if downloads are clearly idling."),
+    "TASTE_REFRESH_MIN": (
+        "How often to re-read your play counts (minutes)",
+        "How often the librarian re-reads what you've been playing from Navidrome, "
+        "Plex/Plexamp, and your YouTube Music history, and re-ranks artists.\n\n"
+        "The default of 360 (6 hours) is plenty — your taste doesn't change by the "
+        "minute, and each refresh costs a round of API calls. Use the 'Refresh taste' "
+        "button if you want it to happen right now."),
+    "MEASURE_EVERY_SEC": (
+        "How often to re-scan the library (seconds)",
+        "How often the librarian walks the library to recount size, tracks, and audio "
+        "quality.\n\n"
+        "The scan is incremental — files that haven't changed are not re-read — so this "
+        "is cheap. Lower it if you want the progress numbers to feel more live; raise it "
+        "if the disk is busy."),
+    "PAUSED": (
+        "Stop queueing downloads, keep everything else running",
+        "Pauses new downloads without stopping the container or losing any progress.\n\n"
+        "In-flight transfers finish, imports keep happening, and the UI stays live. Flip "
+        "it back off and it resumes exactly where it was. Same as the Pause button up top."),
+
+    "TASTE_HALF_LIFE_DAYS": (
+        "A play this old counts half as much",
+        "Makes recent listening matter more than old listening.\n\n"
+        "At the default 365, a song you played a year ago counts half as much as one you "
+        "played today; two years ago, a quarter. Without this, a 2019 obsession would "
+        "weigh exactly as much as last week and the library would grow toward who you "
+        "used to be.\n\n"
+        "Lower it (e.g. 180) to chase your current mood harder. Raise it (e.g. 1095) to "
+        "give long-time favourites more say."),
+    "WEIGHT_NAVIDROME": (
+        "How much Navidrome plays count",
+        "How much weight to give plays from Navidrome — this library, in the web player "
+        "or a Subsonic app.\n\n"
+        "This is direct evidence of what you like, so it's weighted high by default. "
+        "Note Navidrome only reports an album's LAST played date, so the recency decay "
+        "here is coarser than for Plex."),
+    "WEIGHT_PLEX": (
+        "How much Plex / Plexamp plays count",
+        "How much weight to give plays from Plex and Plexamp, read via Tautulli.\n\n"
+        "Plexamp is a Plex client, so its plays are recorded by Plex and never reach "
+        "Navidrome — without Tautulli they'd be invisible. Requires TAUTULLI_API_KEY in "
+        "secrets.env; without it this signal is simply skipped.\n\n"
+        "There's no double-counting: a play is recorded by whichever server actually "
+        "served the audio, never both."),
+    "WEIGHT_YTMUSIC": (
+        "How much YouTube Music history counts",
+        "How much weight to give your YouTube Music listening history from Google "
+        "Takeout.\n\n"
+        "Weighted lower than Navidrome/Plex by default because it's noisier — it "
+        "includes a lot of incidental, background, and one-off listening rather than "
+        "music you deliberately chose. It's most valuable as the cold-start signal "
+        "before you've played much in this library."),
+
+    "FAVORITES_ENABLED": (
+        "Fetch full discographies for favourited artists",
+        "Turns the favourites system on or off.\n\n"
+        "When on, any artist you favourite gets their ENTIRE discography downloaded, and "
+        "is re-checked forever so new releases arrive automatically. Favourite an artist "
+        "by starring them in Navidrome, clicking ★ in the Taste list, or adding them to "
+        "favorites.txt.\n\n"
+        "Turning this off leaves existing downloads alone; it just stops new discography "
+        "syncing."),
+    "FAVORITE_SYNC_HOURS": (
+        "How often to check favourites for new releases",
+        "How often to ask MusicBrainz whether your favourited artists have released "
+        "anything new.\n\n"
+        "This is what makes new albums show up on their own. Daily (24) is plenty — "
+        "artists don't release albums hourly, and MusicBrainz allows only one request "
+        "per second. Use 'Sync favorites' to check right now."),
+    "FAVORITE_PRIORITY": (
+        "Queue position vs ordinary discovery (higher = sooner)",
+        "How far ahead of the normal discovery queue favourites jump.\n\n"
+        "This matters more than it sounds: the 100k-track fill generates thousands of "
+        "candidates, so without a priority boost a favourite's discography would sit "
+        "behind all of them and effectively never download. Anything above 0 puts "
+        "favourites first; the exact number only matters if you want tiers."),
+    "FAVORITE_INCLUDE_EP": (
+        "Include EPs in a favourite's discography",
+        "Whether EPs count as part of 'the discography'.\n\n"
+        "On by default — EPs are usually real, wanted releases. For Glass Animals this "
+        "is the difference between 4 albums and 7 releases."),
+    "FAVORITE_INCLUDE_SINGLES": (
+        "Include singles — warning, there are a LOT",
+        "Whether to also download every single.\n\n"
+        "Off for a good reason. Glass Animals alone has 29 singles and 26 remix singles "
+        "against just 4 studio albums — turning this on takes them from 7 releases to 36, "
+        "and almost all of it is duplicate versions of tracks you already have from the "
+        "albums.\n\n"
+        "Only turn this on for an artist whose singles genuinely aren't on any album."),
+    "FAVORITE_INCLUDE_LIVE": (
+        "Include live albums and broadcasts",
+        "Whether live recordings count as part of the discography.\n\n"
+        "Off by default. These are often radio sessions and broadcast recordings of "
+        "songs you already own, and their audio quality is inconsistent."),
+    "FAVORITE_INCLUDE_COMPILATIONS": (
+        "Include compilations and greatest-hits",
+        "Whether compilations, best-ofs, and greatest-hits count.\n\n"
+        "Off by default, because if you already have the studio albums a compilation is "
+        "almost entirely duplicate tracks."),
+    "FAVORITE_INCLUDE_REMIX": (
+        "Include remix albums and remix singles",
+        "Whether remix releases count.\n\n"
+        "Off by default. Remixes are the single biggest source of near-duplicates — for "
+        "Glass Animals there are 26 remix singles alone."),
+
+    "UPGRADE_ENABLED": (
+        "Re-download lossy albums as FLAC when one appears",
+        "Periodically re-checks albums you own as MP3 or AAC to see whether a FLAC "
+        "version has shown up on Soulseek since you got them.\n\n"
+        "Off by default. When a FLAC is found it's downloaded to a staging area, NOT "
+        "straight into your library. A separate script then verifies it — every file "
+        "must be FLAC, the track count can't drop, every file must fully decode, and the "
+        "running time must match within 5% — before it replaces the old copy.\n\n"
+        "Your old lossy copy is DELETED once the replacement is verified and confirmed "
+        "in place. If any check fails, nothing is touched."),
+    "UPGRADE_HOUR": (
+        "Hour of day to run the upgrade check (0–23)",
+        "What time of day the nightly upgrade pass runs, in 24-hour server local time "
+        "(3 = 3am).\n\n"
+        "It runs once a day at this hour. Pick a time when nobody's streaming and the "
+        "server is otherwise quiet."),
+    "UPGRADE_MAX_PER_RUN": (
+        "Albums checked per nightly pass",
+        "The most albums the upgrade pass will check in one night.\n\n"
+        "This is the main 'don't overwhelm anything' dial. Each check is a full Soulseek "
+        "search against real peers, so checking hundreds at once is both slow and a good "
+        "way to get banned. At 10/night it works through a backlog steadily without "
+        "anyone noticing."),
+    "UPGRADE_RECHECK_DAYS": (
+        "Don't re-check the same album within this many days",
+        "How long to wait before asking about an album again after finding no FLAC.\n\n"
+        "If nobody on Soulseek had a FLAC of an album yesterday, they almost certainly "
+        "won't today either. Waiting 30 days stops the pass from burning its whole nightly "
+        "budget re-asking the same hopeless albums instead of trying new ones."),
+    "UPGRADE_ONLY_WHEN_IDLE": (
+        "Wait for the main download queue to go quiet first",
+        "Makes upgrades yield to the main fill.\n\n"
+        "On by default. Upgrades and normal downloads compete for the same Soulseek "
+        "peers and the same bandwidth; upgrades are a nice-to-have, so they wait rather "
+        "than slow down music you don't have yet."),
+}
+
 CTX = {}
 _write_lock = threading.Lock()
 
@@ -132,6 +327,33 @@ def read_lines(path):
             if l.strip() and not l.strip().startswith("#")]
 
 
+def current_config():
+    """Every setting's current value, as a string.
+
+    Falls back to the librarian's own effective value for keys absent from
+    config.env (they have code defaults). Without this the UI would render those
+    fields blank and saving would write an empty value back over a working default.
+    """
+    on_disk = read_env(CTX["config_env"])
+    try:
+        effective = CTX["cfg"]()
+    except Exception:
+        effective = {}
+    out = {}
+    for k in SETTINGS:
+        if on_disk.get(k, "") != "":
+            out[k] = on_disk[k]
+            continue
+        v = effective.get(k)
+        if isinstance(v, bool):
+            out[k] = "1" if v else "0"
+        elif isinstance(v, float) and SETTINGS[k][0] == "int":
+            out[k] = str(int(v))
+        else:
+            out[k] = "" if v is None else str(v)
+    return out
+
+
 def coerce(key, raw):
     """Validate + clamp one setting. Raises ValueError on anything unacceptable."""
     if key not in SETTINGS:
@@ -202,13 +424,19 @@ class Handler(BaseHTTPRequestHandler):
                     data = json.loads(CTX["status_json"].read_text())
                 except (OSError, ValueError):
                     data = {"updated": None, "note": "no measurement yet"}
-                data["config"] = {k: read_env(CTX["config_env"]).get(k, "")
-                                  for k in SETTINGS}
+                data["config"] = current_config()
                 return self._json(data)
 
             if u.path == "/api/config":
-                cur = read_env(CTX["config_env"])
-                return self._json({k: cur.get(k, "") for k in SETTINGS})
+                return self._json(current_config())
+
+            if u.path == "/api/help":
+                # Served rather than duplicated into the page so HELP stays the one
+                # place these explanations are written.
+                return self._json({k: {"kind": SETTINGS[k][0],
+                                       "min": SETTINGS[k][1], "max": SETTINGS[k][2],
+                                       "short": v[0], "detail": v[1]}
+                                   for k, v in HELP.items() if k in SETTINGS})
 
             if u.path == "/api/exclude":
                 return self._json({"names": read_lines(CTX["exclude_txt"])})
@@ -351,8 +579,33 @@ button:disabled{opacity:.45;cursor:not-allowed}
 button:active{transform:translateY(1px)}
 input,select{background:var(--bg);border:1px solid var(--line);color:var(--fg);
   border-radius:6px;padding:5px 8px;font-size:13px;width:100%}
-label{display:block;font-size:12px;color:var(--dim);margin:9px 0 3px}
-.settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:0 14px}
+label{display:block;font-size:12px;color:var(--dim);margin:0 0 4px}
+/* Each setting is one self-contained block so its label always sits directly above
+   its own input -- a flat grid of alternating label/input cells lets them drift into
+   neighbouring columns as the viewport changes, which mislabels the fields. */
+.settings{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:14px}
+.setting{display:flex;flex-direction:column;justify-content:flex-start}
+.setting .name{color:var(--fg);font-weight:550;font-size:12.5px}
+.setting .desc{display:block;color:var(--dim);font-size:11px;line-height:1.35;
+  margin-top:1px;min-height:29px}
+.setting input,.setting select{margin-top:auto}
+.setting .q{display:inline-flex;align-items:center;justify-content:center;width:13px;
+  height:13px;border-radius:99px;border:1px solid var(--line);color:var(--dim);
+  font-size:9px;font-weight:700;margin-left:5px;cursor:help;vertical-align:1px}
+.setting:hover .q{border-color:var(--acc);color:var(--acc)}
+/* Hover detail box. Fixed-position and appended to <body> so it is never clipped by
+   the settings card's own bounds or scroll container. */
+#tip{position:fixed;z-index:50;max-width:340px;background:var(--card);
+  border:1px solid var(--line);border-radius:9px;padding:11px 13px;
+  box-shadow:0 10px 34px #0009;font-size:12.5px;line-height:1.5;
+  opacity:0;visibility:hidden;transition:opacity .13s;pointer-events:none}
+#tip.on{opacity:1;visibility:visible}
+#tip h4{margin:0 0 6px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  color:var(--acc);font-weight:650;letter-spacing:.2px}
+#tip p{margin:0 0 7px}
+#tip p:last-child{margin-bottom:0}
+#tip .meta{color:var(--dim);font-size:11px;border-top:1px solid var(--line);
+  padding-top:6px;margin-top:8px}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:10px;
   overflow:auto;max-height:320px;font-size:11.5px;line-height:1.55;margin:0}
 .banner{padding:9px 13px;border-radius:8px;margin-bottom:14px;font-size:13px;display:none}
@@ -433,7 +686,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:
   </div>
 
   <div class="card" style="margin-top:14px">
-    <h2>Settings <span class="sub">— saved to config.env, applied next loop</span></h2>
+    <h2>Settings <span class="sub">— saved to config.env, applied next loop · hover any setting for details</span></h2>
     <div class="settings" id="settings"></div>
     <div style="margin-top:13px;display:flex;gap:8px;align-items:center">
       <button id="save">Save settings</button>
@@ -462,6 +715,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:
   </div>
 </div>
 <div id="toast"></div>
+<div id="tip"></div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -476,42 +730,60 @@ async function api(p, opt){ const r = await fetch(p, opt);
 async function post(p, body){ return api(p, {method:'POST',
   headers:{'Content-Type':'application/json'}, body: body?JSON.stringify(body):'{}'}); }
 
-// Which settings render as a checkbox vs a number field.
-const BOOLS = new Set(['PAUSED','FAVORITES_ENABLED','FAVORITE_INCLUDE_EP',
-  'FAVORITE_INCLUDE_SINGLES','FAVORITE_INCLUDE_LIVE','FAVORITE_INCLUDE_COMPILATIONS',
-  'FAVORITE_INCLUDE_REMIX','UPGRADE_ENABLED','UPGRADE_ONLY_WHEN_IDLE']);
-const HELP = {
-  TARGET_TB:'Stop at this library size', TARGET_TRACKS:'…or this many tracks',
-  EXPLORE_RATIO:'0 = only what you love, 1 = only new horizons',
-  MIN_FREE_GB:'Hard floor: never fill the pool below this',
-  STAGING_MIN_FREE_GB:'Pause if the NVMe staging pool gets this low',
-  CONCURRENCY:'Parallel downloads', TASTE_REFRESH_MIN:'Re-pull play counts (min)',
-  MEASURE_EVERY_SEC:'Library re-scan interval (s)',
-  TASTE_HALF_LIFE_DAYS:'A play this old counts half as much',
-  WEIGHT_NAVIDROME:'Weight of Navidrome plays', WEIGHT_PLEX:'Weight of Plex/Plexamp plays',
-  WEIGHT_YTMUSIC:'Weight of YouTube Music history',
-  FAVORITE_SYNC_HOURS:'How often to check favorites for new releases',
-  FAVORITE_PRIORITY:'Queue position vs exploration (higher = sooner)',
-  FAVORITE_INCLUDE_SINGLES:'Warning: adds a LOT of singles',
-  UPGRADE_HOUR:'Hour of day to run the upgrade pass (0–23)',
-  UPGRADE_MAX_PER_RUN:'Albums checked per pass', UPGRADE_RECHECK_DAYS:'Don\'t re-check within N days',
-  UPGRADE_ONLY_WHEN_IDLE:'Yield to the main fill',
-  UPGRADE_ENABLED:'Re-download lossy albums as FLAC when one appears',
-};
+// Setting metadata (type, bounds, plain-English help) comes from the server so it
+// lives in exactly one place — see HELP/SETTINGS in web.py.
+let HELP = {};
+const isBool = k => (HELP[k]||{}).kind === 'bool';
+
+// ---- hover detail box ----------------------------------------------------
+const tip = () => $('#tip');
+function showTip(el, k){
+  const h = HELP[k]; if(!h) return;
+  const bounds = h.kind === 'bool' ? 'on / off'
+    : `allowed: ${h.min} – ${h.max}${h.kind === 'int' ? ' (whole numbers)' : ''}`;
+  tip().innerHTML = `<h4>${esc(k)}</h4>` +
+    h.detail.split('\n\n').map(p => `<p>${esc(p)}</p>`).join('') +
+    `<div class="meta">${esc(bounds)}</div>`;
+  tip().classList.add('on');
+  // Anchor beside the setting, then keep it inside the viewport. Prefer the right,
+  // flip left when there's no room, and clamp vertically rather than letting it run
+  // off the bottom of a long settings grid.
+  const r = el.getBoundingClientRect(), t = tip().getBoundingClientRect();
+  let x = r.right + 10, y = r.top;
+  if(x + t.width > innerWidth - 8) x = r.left - t.width - 10;
+  if(x < 8) x = 8;
+  if(y + t.height > innerHeight - 8) y = innerHeight - t.height - 8;
+  if(y < 8) y = 8;
+  tip().style.left = x + 'px'; tip().style.top = y + 'px';
+}
+const hideTip = () => tip().classList.remove('on');
+
 let settingsBuilt = false;
 function buildSettings(cfg){
-  if(settingsBuilt) return; settingsBuilt = true;
+  if(settingsBuilt || !Object.keys(HELP).length) return; settingsBuilt = true;
   $('#settings').innerHTML = Object.keys(cfg).map(k => {
-    const help = HELP[k] ? `<span class="sub"> — ${esc(HELP[k])}</span>` : '';
-    if(BOOLS.has(k)) return `<label>${k}${help}</label>
-      <select data-k="${k}"><option value="0">off</option><option value="1">on</option></select>`;
-    return `<label>${k}${help}</label><input data-k="${k}" type="number" step="any">`;
+    const h = HELP[k] || {};
+    const field = isBool(k)
+      ? `<select data-k="${k}"><option value="0">off</option><option value="1">on</option></select>`
+      : `<input data-k="${k}" type="number" step="any">`;
+    return `<div class="setting" data-help="${k}">
+      <label><span class="name">${k}</span><span class="q">?</span>
+      <span class="desc">${esc(h.short || '')}</span></label>${field}</div>`;
   }).join('');
   for(const [k,v] of Object.entries(cfg)){
     const el = document.querySelector(`[data-k="${k}"]`); if(!el) continue;
-    el.value = BOOLS.has(k) ? (['1','true','yes','on'].includes(String(v).toLowerCase())?'1':'0') : v;
+    el.value = isBool(k) ? (['1','true','yes','on'].includes(String(v).toLowerCase())?'1':'0') : v;
   }
+  document.querySelectorAll('[data-help]').forEach(el => {
+    el.addEventListener('mouseenter', () => showTip(el, el.dataset.help));
+    el.addEventListener('mouseleave', hideTip);
+    // Keyboard + touch: focusing the field explains it too, so the help isn't
+    // mouse-only.
+    el.addEventListener('focusin', () => showTip(el, el.dataset.help));
+    el.addEventListener('focusout', hideTip);
+  });
 }
+addEventListener('scroll', hideTip, true);
 
 function renderFavs(favs, names){
   const byName = {}; (favs||[]).forEach(f => byName[f.artist.toLowerCase()] = f);
@@ -538,6 +810,8 @@ function renderFavs(favs, names){
 
 async function load(){
   try{
+    // Help text never changes at runtime — fetch it once, not on every 5s poll.
+    if(!Object.keys(HELP).length) HELP = await api('/api/help');
     const [s, arts, lg, exc, fav] = await Promise.all([
       api('/api/status'), api('/api/artists?limit=60'), api('/api/log?n=120'),
       api('/api/exclude'), api('/api/favorites')]);
