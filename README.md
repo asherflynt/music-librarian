@@ -17,6 +17,13 @@ favorites, new releases, the taste ranking, and every tunable setting.
 > **LAN only, no auth**, by design — same posture as slskd/Soulbeet/Navidrome on this
 > network. **Do not route it through the Cloudflared tunnel**: it can change download
 > targets and, with upgrades enabled, cause files to be deleted.
+>
+> State-changing requests (all POSTs) are CSRF-guarded: a request carrying a
+> cross-origin `Origin` header is rejected, so a random web page you happen to open
+> can't silently drive the API (this also blunts DNS-rebinding). Requests with no
+> `Origin` — curl, scripts — are still allowed, so automation is unaffected. This is
+> hardening, not a substitute for auth: anyone who can reach port 8730 can still use
+> the UI directly, which is why it must stay on a trusted LAN.
 
 ## Layout on the server
 

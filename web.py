@@ -412,14 +412,38 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj), "application/json")
 
+    MAX_BODY = 1 << 20   # 1 MiB — this API only ever receives small JSON
+
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0:
+            return {}
+        if n > self.MAX_BODY:
+            # Don't read an attacker-declared multi-GB Content-Length into memory.
             return {}
         try:
             return json.loads(self.rfile.read(n) or "{}")
         except ValueError:
             return {}
+
+    def _same_origin(self):
+        """CSRF guard for state-changing requests.
+
+        This server is unauthenticated by design (LAN only), which means any web page
+        the user happens to open could otherwise POST to it cross-origin and change
+        settings, clear the kids-music blocklist, or trigger a scan -- and, via DNS
+        rebinding, even read responses. Browsers attach an Origin header to such
+        cross-origin POSTs, so requiring Origin (when present) to match the Host we
+        were reached on rejects them. Same-origin requests from our own page match and
+        pass; tools like curl send no Origin and are allowed, so automation is
+        unaffected. No allowlist to maintain and no way to lock the user out: the check
+        is relative to whatever host they actually used.
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = self.headers.get("Host", "")
+        return urlparse(origin).netloc == host
 
     # -- GET ----------------------------------------------------------------
     def do_GET(self):
@@ -483,6 +507,10 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         st = CTX["state"]
         try:
+            if not self._same_origin():
+                return self._json(
+                    {"error": "cross-origin request rejected"}, 403)
+
             if u.path == "/api/config":
                 body = self._body()
                 updates, errors = {}, []
