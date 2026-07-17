@@ -1,0 +1,20 @@
+# Favorited artists — one per line, exact artist name.
+#
+# A favorite gets their ENTIRE discography downloaded (every album/EP MusicBrainz
+# lists), and is re-checked every FAVORITE_SYNC_HOURS forever, so new releases are
+# picked up automatically as they come out. Favorites are queued ahead of the normal
+# exploration crawl.
+#
+# Three ways to favorite an artist, all equivalent:
+#   1. Star the artist in Navidrome (easiest — do it while listening)
+#   2. Click ★ next to an artist in the web UI
+#   3. Add a line here
+#
+# Names are matched against MusicBrainz. Use the artist's canonical name; if it's
+# ambiguous the librarian logs the near-miss rather than guessing and downloading
+# the wrong band's discography.
+#
+# NOTE: exclude.txt wins over this file. If an artist appears in both, the librarian
+# honors the blocklist and logs the conflict.
+#
+# Empty by default — add your own.

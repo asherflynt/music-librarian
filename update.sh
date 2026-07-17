@@ -21,6 +21,8 @@ MUSIC_DIR="${MUSIC_DIR:-/mnt/user/Media/Music}"
 CLUSTER_DIR="${CLUSTER_DIR:-/mnt/cluster}"
 CACHE_DIR="${CACHE_DIR:-/mnt/cache}"
 TARGET_FOLDER="${TARGET_FOLDER:-/music}"
+TAUTULLI_URL="${TAUTULLI_URL:-}"
+WEB_PORT="${WEB_PORT:-8730}"
 
 echo ">> git pull"
 git pull --ff-only
@@ -30,13 +32,22 @@ docker build -t librarian:latest .
 
 echo ">> recreating container (a plain restart would keep the OLD image)"
 docker rm -f librarian >/dev/null 2>&1 || true
+# Note: no mount is needed for the FLAC-upgrade staging dir. Upgrades stage into
+# <music>/_upgrades, which is inside the /music mount both this container and
+# Soulbeet already have. Soulbeet does create_dir_all(target_folder) *in its own
+# container*, so any path outside its mounts (e.g. a bare /upgrades) would be
+# created in its writable layer and silently lost.
 docker run -d --name librarian --restart unless-stopped \
+  -p "$WEB_PORT":8730 \
   -e SOULBEET_URL="$SOULBEET_URL" \
   -e NAVIDROME_URL="$NAVIDROME_URL" \
+  -e TAUTULLI_URL="$TAUTULLI_URL" \
   -e MUSIC_PATH=/music \
   -e FREE_SPACE_PATH=/cluster \
   -e STAGING_PATH=/cache \
   -e TARGET_FOLDER="$TARGET_FOLDER" \
+  -e UPGRADE_FOLDER="$TARGET_FOLDER/_upgrades" \
+  -e WEB_PORT=8730 \
   -v "$CONFIG_DIR":/config \
   -v "$CONFIG_DIR/state":/data \
   -v "$MUSIC_DIR":/music:ro \
@@ -56,3 +67,4 @@ else
   exit 1
 fi
 echo ">> done. Runtime config/secrets in $CONFIG_DIR are untouched."
+echo ">> UI: http://$(hostname -i 2>/dev/null | awk '{print $1}'):$WEB_PORT  (LAN only — do not tunnel it)"
