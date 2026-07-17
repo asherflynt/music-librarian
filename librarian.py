@@ -179,6 +179,7 @@ def load_config():
         "CONCURRENCY": max(1, num("CONCURRENCY", 3, int)),
         "TASTE_REFRESH_MIN": num("TASTE_REFRESH_MIN", 360, int),   # re-pull play counts every 6h
         "MEASURE_EVERY_SEC": num("MEASURE_EVERY_SEC", 300, int),
+        "SCAN_MAX_PROBES_PER_PASS": max(1, num("SCAN_MAX_PROBES_PER_PASS", 250, int)),
         "PAUSED": flag("PAUSED"),
         # taste weighting
         "TASTE_HALF_LIFE_DAYS": max(1.0, num("TASTE_HALF_LIFE_DAYS", 365, float)),
@@ -1286,12 +1287,22 @@ def _tags_of(path, fallback_dir):
     return artist, album
 
 
-def measure_library(state=None):
+def measure_library(state=None, max_probes=None):
     """Walk the library once for size, track count, and per-file quality.
 
     Incremental: a file whose (size, mtime) is unchanged is not re-opened, so the
     steady-state cost is a stat() per file rather than a tag parse. That matters --
     this runs every MEASURE_EVERY_SEC against a library headed for 100k files.
+
+    `max_probes` bounds how many NEW/CHANGED files get opened per pass, and exists
+    for a specific reason: the library is reached through Unraid's /mnt/user FUSE
+    layer (shfs), which is a single-threaded chokepoint shared with Plex, slskd,
+    beets and everything else on the box. Walking it to stat() files is cheap and has
+    always been fine, but *opening* every file to read tags is not -- doing that to
+    the whole library in one tight loop is believed to be what wedged the server on
+    2026-07-17 (every process touching /mnt/user piled into uninterruptible D state
+    until a hard reboot). Probing is therefore rate-limited and simply resumes next
+    pass: the walk stays complete and correct, only the expensive part is spread out.
     """
     total_bytes = 0
     track_count = 0
@@ -1299,6 +1310,7 @@ def measure_library(state=None):
     seen = set()
     pending = []
     reprobed = 0
+    unprobed = 0
 
     for root, dirs, files in os.walk(MUSIC_PATH):
         # The upgrade staging dir lives inside the library tree (see UPGRADE_FOLDER).
@@ -1324,6 +1336,12 @@ def measure_library(state=None):
             prev = known.get(full)
             if prev and prev[0] == st.st_size and prev[1] == int(st.st_mtime):
                 continue
+            # Budget exhausted: leave it for the next pass rather than hammering
+            # shfs. Size/track totals above are already counted, so only the quality
+            # breakdown lags -- and it catches up on its own.
+            if max_probes is not None and reprobed >= max_probes:
+                unprobed += 1
+                continue
             probed = probe_file(full)
             if not probed:
                 continue
@@ -1342,8 +1360,15 @@ def measure_library(state=None):
         gone = set(known) - seen
         if gone:
             state.drop_files(gone)   # files removed/renamed shouldn't linger in stats
-        if reprobed or gone:
-            log(f"Library scan: {reprobed} new/changed file(s) probed, {len(gone)} removed")
+        if reprobed or gone or unprobed:
+            msg = f"Library scan: {reprobed} new/changed file(s) probed"
+            if gone:
+                msg += f", {len(gone)} removed"
+            if unprobed:
+                msg += (f", {unprobed} awaiting probe (rate-limited to "
+                        f"{max_probes}/pass to protect the /mnt/user FUSE layer)")
+            log(msg)
+        state.set_meta("unprobed_files", unprobed)
     return total_bytes, track_count
 
 
@@ -1606,6 +1631,10 @@ def write_status(state, cfg, lib_bytes, track_count, free):
                                       if lib_total else None)
     status["upgrades"] = state.upgrade_counts()
     status["upgrade_candidates"] = lib_total - lib_lossless
+    # The quality breakdown only covers files probed so far. Say so, rather than
+    # letting a partial scan read as a complete picture of the library.
+    status["scan_unprobed"] = int(state.get_meta("unprobed_files", "0") or 0)
+    status["scan_complete"] = status["scan_unprobed"] == 0
     status["new_releases"] = [
         {"artist": a, "album": b, "released": rel, "found_at": f}
         for (a, b, rel, f) in state.recent_new_releases(10)
@@ -1684,7 +1713,8 @@ def main():
 
         # periodic library measurement (throttled — walking 100k files is not free)
         if time.time() - last_measure > cfg["MEASURE_EVERY_SEC"]:
-            lib_bytes, track_count = measure_library(state)
+            lib_bytes, track_count = measure_library(
+                state, max_probes=cfg["SCAN_MAX_PROBES_PER_PASS"])
             free = free_gb(FREE_SPACE_PATH)
             last_measure = time.time()
             write_status(state, cfg, lib_bytes, track_count, free)

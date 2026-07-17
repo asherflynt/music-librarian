@@ -33,6 +33,7 @@ SETTINGS = {
     "CONCURRENCY":              ("int", 1, 16),
     "TASTE_REFRESH_MIN":        ("int", 5, 100_000),
     "MEASURE_EVERY_SEC":        ("int", 30, 86_400),
+    "SCAN_MAX_PROBES_PER_PASS": ("int", 10, 100_000),
     "PAUSED":                   ("bool", 0, 1),
     "TASTE_HALF_LIFE_DAYS":     ("float", 1.0, 36_500.0),
     "WEIGHT_NAVIDROME":         ("float", 0.0, 100.0),
@@ -120,6 +121,18 @@ HELP = {
         "The scan is incremental — files that haven't changed are not re-read — so this "
         "is cheap. Lower it if you want the progress numbers to feel more live; raise it "
         "if the disk is busy."),
+    "SCAN_MAX_PROBES_PER_PASS": (
+        "How many new files to analyse per scan (safety limit)",
+        "How many new or changed files the librarian opens per scan pass to read "
+        "their real audio format.\n\n"
+        "This is a safety limit rather than a speed dial. Your library is reached "
+        "through Unraid's /mnt/user layer, which is a single shared chokepoint that "
+        "Plex, slskd, beets and everything else also go through. Counting files there "
+        "is cheap; opening thousands of them in a tight loop is not — that is what "
+        "locked the server up hard enough to need a power cycle on 17 Jul 2026.\n\n"
+        "Files that don't fit in a pass simply wait for the next one, so the scan "
+        "still finishes — it just spreads the load. At the default it works through "
+        "roughly 3,000 files an hour. Only raise it if you know the server is idle."),
     "PAUSED": (
         "Stop queueing downloads, keep everything else running",
         "Pauses new downloads without stopping the container or losing any progress.\n\n"
@@ -845,9 +858,13 @@ async function load(){
       '<tr><td class="muted" colspan="4">No scan yet.</td></tr>';
     const uc = s.upgrade_candidates ?? 0;
     const ups = s.upgrades || {};
-    $('#upcand').textContent = uc ? `${uc.toLocaleString()} lossy track(s) — upgrade candidates` +
+    let qnote = uc ? `${uc.toLocaleString()} lossy track(s) — upgrade candidates` +
       (Object.keys(ups).length ? ' · ' + Object.entries(ups).map(([k,v])=>`${k}: ${v}`).join(', ') : '')
-      : 'Everything on disk is lossless.';
+      : 'Everything scanned so far is lossless.';
+    // A partial scan must not read as a finished one — these numbers are a subset
+    // until every file has been probed.
+    if(s.scan_unprobed > 0) qnote += ` · scan in progress: ${s.scan_unprobed.toLocaleString()} file(s) not yet analysed`;
+    $('#upcand').textContent = qnote;
 
     // counts
     const C = [['queued_flac','FLAC','ok'],['queued_alac','ALAC','ok'],

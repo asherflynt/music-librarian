@@ -142,6 +142,15 @@ How often the librarian walks the library to recount size, tracks, and audio qua
 
 The scan is incremental — files that haven't changed are not re-read — so this is cheap. Lower it if you want the progress numbers to feel more live; raise it if the disk is busy.
 
+#### `SCAN_MAX_PROBES_PER_PASS`
+**How many new files to analyse per scan (safety limit)** · default `250` · 10 – 100000
+
+How many new or changed files the librarian opens per scan pass to read their real audio format.
+
+This is a safety limit rather than a speed dial. Your library is reached through Unraid's /mnt/user layer, which is a single shared chokepoint that Plex, slskd, beets and everything else also go through. Counting files there is cheap; opening thousands of them in a tight loop is not — that is what locked the server up hard enough to need a power cycle on 17 Jul 2026.
+
+Files that don't fit in a pass simply wait for the next one, so the scan still finishes — it just spreads the load. At the default it works through roughly 3,000 files an hour. Only raise it if you know the server is idle.
+
 #### `PAUSED`
 **Stop queueing downloads, keep everything else running** · default `off` · on / off
 

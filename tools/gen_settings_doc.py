@@ -22,7 +22,7 @@ END = "<!-- END SETTINGS-TABLE -->"
 GROUPS = [
     ("Targets & pacing", ["TARGET_TB", "TARGET_TRACKS", "EXPLORE_RATIO", "MIN_FREE_GB",
                           "STAGING_MIN_FREE_GB", "CONCURRENCY", "TASTE_REFRESH_MIN",
-                          "MEASURE_EVERY_SEC", "PAUSED"]),
+                          "MEASURE_EVERY_SEC", "SCAN_MAX_PROBES_PER_PASS", "PAUSED"]),
     ("Taste weighting", ["TASTE_HALF_LIFE_DAYS", "WEIGHT_NAVIDROME", "WEIGHT_PLEX",
                          "WEIGHT_YTMUSIC"]),
     ("Favorites (full discography + new releases)",
