@@ -1696,6 +1696,17 @@ def main():
         cfg = load_config()
         exclude_set = load_exclude_set()
 
+        # periodic library measurement (throttled — walking 100k files is not free).
+        # Runs before the pause/stop checks so the UI stays live and the status file
+        # always reflects the real state — including `paused`, so the UI's Pause
+        # button correctly flips to Resume while we're idling below.
+        if time.time() - last_measure > cfg["MEASURE_EVERY_SEC"]:
+            lib_bytes, track_count = measure_library(
+                state, max_probes=cfg["SCAN_MAX_PROBES_PER_PASS"])
+            free = free_gb(FREE_SPACE_PATH)
+            last_measure = time.time()
+            write_status(state, cfg, lib_bytes, track_count, free)
+
         if cfg["PAUSED"]:
             busy.clear()
             log("PAUSED via config.env; sleeping 60s")
@@ -1710,14 +1721,6 @@ def main():
                 f"pausing downloads 2 min to let imports drain")
             time.sleep(120)
             continue
-
-        # periodic library measurement (throttled — walking 100k files is not free)
-        if time.time() - last_measure > cfg["MEASURE_EVERY_SEC"]:
-            lib_bytes, track_count = measure_library(
-                state, max_probes=cfg["SCAN_MAX_PROBES_PER_PASS"])
-            free = free_gb(FREE_SPACE_PATH)
-            last_measure = time.time()
-            write_status(state, cfg, lib_bytes, track_count, free)
 
         reason = stop_reason(cfg, lib_bytes, track_count, free)
         if reason:

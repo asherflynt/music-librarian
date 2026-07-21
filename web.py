@@ -960,9 +960,10 @@ $('#save').onclick = async () => {
 };
 $('#pause').onclick = async () => {
   const paused = $('#pause').textContent === 'Resume';
-  await post(paused ? '/api/resume' : '/api/pause');
-  settingsBuilt = false;                  // PAUSED changed underneath the form
-  toast(paused ? 'Resumed' : 'Paused'); load();
+  try{ await post(paused ? '/api/resume' : '/api/pause');
+    settingsBuilt = false;                  // PAUSED changed underneath the form
+    toast(paused ? 'Resumed' : 'Paused'); load(); }
+  catch(e){ toast('Error: ' + e.message); }
 };
 $('#refresh').onclick = async () => { await post('/api/refresh-taste'); toast('Taste refresh queued'); };
 $('#syncfav').onclick = async () => { await post('/api/sync-favorites'); toast('Favorites sync queued'); };
