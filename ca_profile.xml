@@ -1,0 +1,9 @@
+<CommunityApplications>
+  <Profile>
+Music Librarian is a self-hosted, taste-driven, resumable FLAC-preferred auto-fill for a Navidrome + Soulbeet music library. It seeds from what your household actually plays (Navidrome and Plex/Plexamp play counts, plus YouTube Music Takeout history), expands taste via Last.fm, downloads through the existing Soulbeet API with a FLAC-preferred / high-quality-lossy fallback ladder, keeps favorited artists' full discographies current via MusicBrainz, and can re-acquire lossy albums as FLAC on a schedule. State lives in SQLite, so restarts resume exactly where they left off.
+
+Support and full documentation are on the project page.
+  </Profile>
+  <Icon>https://raw.githubusercontent.com/asherflynt/music-librarian/main/icon.svg</Icon>
+  <WebPage>https://github.com/asherflynt/music-librarian</WebPage>
+</CommunityApplications>

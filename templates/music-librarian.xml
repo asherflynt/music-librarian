@@ -1,0 +1,54 @@
+<Container version="2">
+  <Name>music-librarian</Name>
+  <Repository>ghcr.io/asherflynt/music-librarian:latest</Repository>
+  <Registry>https://ghcr.io/asherflynt/music-librarian</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+
+  <Icon>https://raw.githubusercontent.com/asherflynt/music-librarian/main/icon.png</Icon>
+
+  <WebUI>http://[IP]:[PORT:8730]</WebUI>
+
+  <Overview>
+Self-hosted, taste-driven, resumable FLAC-preferred auto-fill for a Navidrome + Soulbeet music library.
+
+Music Librarian seeds from what your household actually plays — Navidrome and Plex/Plexamp play counts (Plex via Tautulli), plus YouTube Music Takeout history — expands that taste via Last.fm, and downloads through your existing Soulbeet API using a FLAC-preferred, high-quality-lossy fallback ladder. It keeps favorited artists' full discographies current via MusicBrainz (new releases arrive on their own) and can re-acquire lossy albums as FLAC on a schedule, verifying every staged FLAC before it replaces anything. All progress lives in SQLite, so a restart resumes exactly where it left off. Every knob is editable live in the web UI (no restart).
+
+COMPANION APP: this is not a standalone downloader. It drives an existing Soulbeet instance and reads an existing Navidrome library — you need both already running. Tautulli (Plex plays) and a Last.fm API key are optional/required as noted below.
+
+SECURITY: the web UI is LAN-only and unauthenticated by design (same posture as slskd/Soulbeet/Navidrome). It can change download targets and, with upgrades enabled, delete files — do NOT expose port 8730 through a reverse proxy or tunnel. POSTs are CSRF/Origin-guarded, but that is hardening, not auth.
+
+FIRST RUN: /config starts empty and is auto-seeded with config.env, secrets.env, exclude.txt and favorites.txt. Edit /config/secrets.env with your LASTFM_API_KEY, SOULBEET_USER and SOULBEET_PASS (Navidrome/Soulbeet login). The container waits — it does not crash — until those are filled; no restart is needed once you save.
+  </Overview>
+
+  <Project>https://github.com/asherflynt/music-librarian</Project>
+  <Support>https://github.com/asherflynt/music-librarian/issues</Support>
+  <TemplateURL>https://raw.githubusercontent.com/asherflynt/music-librarian/main/templates/music-librarian.xml</TemplateURL>
+  <ReadMe>https://raw.githubusercontent.com/asherflynt/music-librarian/main/README.md</ReadMe>
+
+  <Category>MediaApp:Music Tools:System</Category>
+  <ExtraSearchTerms>navidrome soulbeet soulseek slskd flac lastfm musicbrainz tautulli plexamp music</ExtraSearchTerms>
+  <Requires>A running Soulbeet instance and a Navidrome library. A free Last.fm API key. Optional: Tautulli for Plex/Plexamp play history.</Requires>
+
+  <Date>2026-07-25</Date>
+  <MinVer>6.10</MinVer>
+  <License>MIT</License>
+
+  <!-- ===== Port ===== -->
+  <Config Name="WebUI" Target="8730" Default="8730" Mode="tcp" Description="Web UI / API port. LAN only — do not expose it through a reverse proxy or tunnel." Type="Port" Display="always" Required="true" Mask="false">8730</Config>
+
+  <!-- ===== Paths ===== -->
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/music-librarian" Mode="rw" Description="Settings, secrets and Google Takeout drop-folder. Auto-seeded on first run; your edits are preserved across updates." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/music-librarian</Config>
+  <Config Name="State" Target="/data" Default="/mnt/user/appdata/music-librarian/state" Mode="rw" Description="SQLite progress database and live status snapshot. Keep this to resume exactly where you left off." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/music-librarian/state</Config>
+  <Config Name="Music library (read-only)" Target="/music" Default="/mnt/user/Media/Music" Mode="ro" Description="Your existing music library, mounted read-only for size / track-count / quality measurement only. Downloads land via Soulbeet, not through this mount." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Media/Music</Config>
+  <Config Name="Free-space pool (read-only)" Target="/cluster" Default="/mnt/user" Mode="ro" Description="The pool that holds the library. Its free space is measured against MIN_FREE_GB — the librarian stops adding music if this pool drops below that floor. Point it at your bulk pool (e.g. /mnt/cluster) or /mnt/user." Type="Path" Display="always" Required="true" Mask="false">/mnt/user</Config>
+  <Config Name="Staging pool (read-only)" Target="/cache" Default="/mnt/cache" Mode="ro" Description="The fast pool Soulbeet downloads land on before beets imports them. Measured against STAGING_MIN_FREE_GB to protect the cache SSD. Point it at the same pool Soulbeet/slskd stage into." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/cache</Config>
+
+  <!-- ===== Connections ===== -->
+  <Config Name="SOULBEET_URL" Target="SOULBEET_URL" Default="http://192.168.1.10:9765" Mode="" Description="Where Soulbeet's API is reachable from inside this container. On bridge networking use the Unraid host's LAN IP and Soulbeet's host port, NOT localhost or a container name." Type="Variable" Display="always" Required="true" Mask="false">http://192.168.1.10:9765</Config>
+  <Config Name="NAVIDROME_URL" Target="NAVIDROME_URL" Default="http://192.168.1.10:4533" Mode="" Description="Where your Navidrome server is reachable from inside this container. On bridge networking use the host's LAN IP, not localhost." Type="Variable" Display="always" Required="true" Mask="false">http://192.168.1.10:4533</Config>
+  <Config Name="TAUTULLI_URL" Target="TAUTULLI_URL" Default="" Mode="" Description="OPTIONAL. Tautulli base URL, to count Plex/Plexamp plays toward your taste. Leave blank to skip the Plex signal (never an error). The API key itself goes in /config/secrets.env." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="TARGET_FOLDER" Target="TARGET_FOLDER" Default="/music" Mode="" Description="Advanced. The library path as SOULBEET sees it (passed to Soulbeet's download queue), not as this container sees it. Only change it if Soulbeet mounts your library somewhere other than /music." Type="Variable" Display="advanced" Required="false" Mask="false">/music</Config>
+
+</Container>

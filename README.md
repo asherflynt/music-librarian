@@ -9,6 +9,33 @@ high-quality-lossy fallback ladder, keeps favorited artists' full discographies
 current via MusicBrainz, and can re-acquire lossy albums as FLAC on a schedule.
 State is in SQLite, so restarts resume exactly where they left off.
 
+> **Companion app, not a standalone downloader.** It drives an existing **Soulbeet**
+> instance and reads an existing **Navidrome** library — both must already be running.
+> A free **Last.fm** API key is required; **Tautulli** (for Plex/Plexamp plays) is optional.
+
+## Install on Unraid (Community Applications)
+
+Search **Music Librarian** in the **Apps** tab and install. The template pulls a
+prebuilt image from `ghcr.io/asherflynt/music-librarian` — no building on the box.
+
+On first start the container **auto-seeds** an empty `/config` with `config.env`,
+`secrets.env`, `exclude.txt` and `favorites.txt`. Then:
+
+1. Edit **`/mnt/user/appdata/music-librarian/secrets.env`** and fill in
+   `LASTFM_API_KEY`, `SOULBEET_USER`, `SOULBEET_PASS` (your Navidrome/Soulbeet login).
+   Optionally add `TAUTULLI_API_KEY`. The container **waits** for these — it never
+   crash-loops — and picks them up within a minute of saving, no restart needed.
+2. Set **`SOULBEET_URL`** and **`NAVIDROME_URL`** in the template to your host's LAN IP
+   and their ports (on bridge networking, *not* `localhost`).
+3. Point the **Music library** / **Free-space pool** / **Staging pool** mounts at the
+   right shares for your box.
+
+Open the UI at **http://\<server\>:8730**. Every knob has hover help and is editable live.
+
+> **Keep it on the LAN.** The UI is unauthenticated by design and can change download
+> targets and (with upgrades on) delete files. Do **not** put port 8730 behind a
+> reverse proxy or tunnel. See the security note under **Web UI** below.
+
 ## Web UI
 
 **http://\<server\>:8730** — progress, real library quality breakdown, download stats,
@@ -40,7 +67,10 @@ favorites, new releases, the taste ranking, and every tunable setting.
 /mnt/user/Media/Music/_upgrades/   # FLAC upgrade staging, pre-verification (auto)
 ```
 
-## Build & run (on Unraid)
+## Build & run from source (advanced)
+
+> Not needed for a Community Applications install — that pulls the prebuilt image.
+> This is for running from a local clone (the `update.sh` workflow).
 
 ```
 docker build -t librarian /mnt/user/appdata/librarian/build
@@ -469,3 +499,26 @@ in, granting root-equivalent host control to a container that parses external da
 
 The host-side User Script avoids both problems, and runs on its own schedule
 independent of this container's auth/paused state.
+
+## Maintainer: releasing & Community Applications
+
+The image is published to **GHCR** by
+[`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) on every
+push to `main` and every `v*` tag (multi-arch amd64/arm64). Cut a release with:
+
+```
+git tag v2.1.0 && git push origin v2.1.0
+```
+
+Then make the package public **once**: GitHub → your profile → **Packages** →
+`music-librarian` → **Package settings** → *Change visibility* → **Public**. CA can
+only pull a public image.
+
+Community Applications reads two files from the repo root/`templates/`:
+
+- [`ca_profile.xml`](ca_profile.xml) — repository metadata + icon.
+- [`templates/music-librarian.xml`](templates/music-librarian.xml) — the app template
+  (`<TemplateURL>` must stay pointed at that file's raw URL).
+
+To submit or update the listing, go to **https://ca.unraid.net/submit**, point it at
+this repository, and run **Validate** then **Scan**. Re-run after any XML change.
