@@ -13,7 +13,7 @@
 #
 # Install: /boot/config/plugins/user.scripts/scripts/librarian-rescue-sweep/script
 
-DL_HOST="/mnt/user/appdata/slskd/downloads"   # staging, as seen from the host
+DL_HOST="/mnt/cluster/Media/slskd_downloads"   # staging, as seen from the host
 DL_CTR="/downloads"                            # same dir, as seen inside soulbeet
 BEETS_CFG="/config/config.yaml"                # soulbeet's beets config (in-container)
 LIB_DB="/music/.beets_library.db"              # shared library db (in-container)
