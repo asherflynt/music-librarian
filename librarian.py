@@ -188,6 +188,7 @@ def load_config():
         "WEIGHT_YTMUSIC": num("WEIGHT_YTMUSIC", 1.0, float),
         # favorites (MusicBrainz full-discography + new releases)
         "FAVORITES_ENABLED": flag("FAVORITES_ENABLED", "1"),
+        "FAVORITES_BYPASS_CAP": flag("FAVORITES_BYPASS_CAP", "1"),
         "FAVORITE_SYNC_HOURS": max(1, num("FAVORITE_SYNC_HOURS", 24, int)),
         "FAVORITE_PRIORITY": num("FAVORITE_PRIORITY", 100, int),
         "FAVORITE_INCLUDE_EP": flag("FAVORITE_INCLUDE_EP", "1"),
@@ -383,12 +384,20 @@ class State:
                 self.conn.commit()
             return False
 
-    def pending_candidates(self, limit):
+    def pending_candidates(self, limit, min_priority=None):
         with self.lock:
-            rows = self.conn.execute(
-                "SELECT key, artist, album, kind FROM candidates WHERE status='pending' "
-                "ORDER BY priority DESC, updated_at ASC LIMIT ?", (limit,)
-            ).fetchall()
+            if min_priority is not None:
+                rows = self.conn.execute(
+                    "SELECT key, artist, album, kind FROM candidates "
+                    "WHERE status='pending' AND priority >= ? "
+                    "ORDER BY priority DESC, updated_at ASC LIMIT ?",
+                    (min_priority, limit),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT key, artist, album, kind FROM candidates WHERE status='pending' "
+                    "ORDER BY priority DESC, updated_at ASC LIMIT ?", (limit,)
+                ).fetchall()
         return rows
 
     def top_artists(self, limit=100):
@@ -599,15 +608,26 @@ class Soulbeet:
         r.raise_for_status()
         return r.json()
 
+    @staticmethod
+    def _extract_results(d):
+        """Accept both Soulbeet 2026-11+ bare JSON lists and legacy {'results': [...]}."""
+        if isinstance(d, list):
+            return d
+        if isinstance(d, dict):
+            return d.get("results") or []
+        return []
+
     def search_album(self, artist, query):
         d = self._post("/api/metadata/search/album",
                        {"input": {"query": query, "artist": artist, "provider": None}})
-        return [x for x in d.get("results", []) if x.get("kind") == "Album"]
+        return [x for x in self._extract_results(d)
+                if isinstance(x, dict) and x.get("kind") == "Album"]
 
     def search_track(self, artist, query):
         d = self._post("/api/metadata/search/track",
                        {"input": {"query": query, "artist": artist, "provider": None}})
-        return [x for x in d.get("results", []) if x.get("kind") == "Track"]
+        return [x for x in self._extract_results(d)
+                if isinstance(x, dict) and x.get("kind") == "Track"]
 
     def start_search(self, album, tracks):
         return self._post("/api/download/search/start",
@@ -624,28 +644,138 @@ class Soulbeet:
                 return res
             time.sleep(3)
 
-    def queue(self, items, target_folder=None):
-        return self._post("/api/downloads/queue",
-                          {"req": {"items": items,
-                                   "target_folder": target_folder or TARGET_FOLDER,
-                                   "backend": None}})
+    def queue(self, items, search_id, target_folder=None):
+        res = self._post("/api/downloads/queue",
+                         {"req": {"items": items,
+                                  "search_id": search_id,
+                                  "target_folder": target_folder or TARGET_FOLDER,
+                                  "backend": None}})
+        errs = queue_response_errors(res, expected_count=len(items))
+        if errs:
+            raise RuntimeError(f"Soulbeet queue failed: {'; '.join(errs)}")
+        return res
+
+
+_QUEUE_FAIL_TOKENS = (
+    "fail", "error", "reject", "denied", "cancel", "abort", "timeout",
+    "timed_out", "timedout", "invalid", "unavail", "refus",
+)
+
+
+def _status_is_failure(val):
+    """True if a Soulbeet queue item status (string or serde-tagged dict) signals failure."""
+    if isinstance(val, str):
+        low = val.strip().lower()
+        return any(tok in low for tok in _QUEUE_FAIL_TOKENS)
+    if isinstance(val, dict):
+        for k, v in val.items():
+            if _status_is_failure(k) or _status_is_failure(v):
+                return True
+    return False
+
+
+def queue_response_errors(resp, expected_count=None):
+    """Return failure descriptions for a /api/downloads/queue response, or [] if OK.
+
+    Soulbeet 2026-11+ returns a list like [{"id": "...", "status": "Enqueued"}].
+    Legacy dict responses without error fields are treated as OK.
+    """
+    errors = []
+    if resp is None:
+        if expected_count:
+            return ["empty response from /api/downloads/queue"]
+        return []
+    if isinstance(resp, dict):
+        if resp.get("error") or resp.get("ServerError"):
+            errors.append(str(resp.get("error") or resp.get("ServerError")))
+        elif _status_is_failure(resp.get("status")):
+            errors.append(f"status={resp.get('status')!r}")
+        return errors
+    if isinstance(resp, list):
+        if expected_count and len(resp) == 0:
+            return [f"expected {expected_count} queued item(s), got empty list"]
+        for i, entry in enumerate(resp):
+            if not isinstance(entry, dict):
+                if _status_is_failure(entry):
+                    errors.append(f"item[{i}]: {entry!r}")
+                continue
+            item_id = entry.get("id") or entry.get("title") or f"item[{i}]"
+            err = entry.get("error") or entry.get("err")
+            if err:
+                errors.append(f"{item_id}: {err}")
+                continue
+            if entry.get("ok") is False or entry.get("success") is False:
+                errors.append(f"{item_id}: {entry.get('message') or entry.get('status') or 'failed'}")
+                continue
+            st = entry.get("status")
+            if _status_is_failure(st):
+                msg = entry.get("message") or entry.get("reason")
+                detail = f"status={st!r}" + (f" ({msg})" if msg else "")
+                errors.append(f"{item_id}: {detail}")
+        return errors
+    return []
+
+
+def _pos_float(v):
+    if v is None or isinstance(v, bool):
+        return 0.0
+    try:
+        n = float(v)
+        return n if (n > 0 and n == n and n != float("inf")) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _dur_seconds(v):
+    """Parse duration in seconds from int/float, numeric string, 'MM:SS', 'H:MM:SS', or None."""
+    if v is None or isinstance(v, bool):
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v) if (v > 0 and v == v and v != float("inf")) else 0.0
+    s = str(v).strip()
+    if not s:
+        return 0.0
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) not in (2, 3):
+            return 0.0
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError:
+            return 0.0
+        if any(n < 0 or n != n or n == float("inf") for n in nums):
+            return 0.0
+        total = (nums[0] * 60.0 + nums[1]) if len(parts) == 2 else (
+            nums[0] * 3600.0 + nums[1] * 60.0 + nums[2])
+        return total if total > 0 else 0.0
+    return _pos_float(s)
 
 
 def est_kbps(item):
-    """Effective bitrate from size/duration. The backend only tells us the file
+    """Effective bitrate in kbps. Prefers Soulbeet's reported facts.bitrate_kbps when
+    present, falling back to size/duration. The backend only tells us the file
     EXTENSION, not the codec -- and .m4a is used by both ALAC (lossless) and AAC
     (lossy). Bitrate is what actually separates them: ALAC lands ~600-900 kbps,
     AAC caps around 320."""
-    size = item.get("size") or 0
-    dur = item.get("duration") or 0
+    facts = item.get("facts")
+    if isinstance(facts, dict):
+        reported = _pos_float(facts.get("bitrate_kbps"))
+        if reported > 0:
+            return reported
+    size = _pos_float(item.get("size"))
+    dur = _dur_seconds(item.get("duration"))
     if size > 0 and dur > 0:
         return (size * 8) / dur / 1000
     return 0.0
 
 
-def group_kbps(g):
-    vals = [k for k in (est_kbps(it) for it in g.get("items", [])) if k > 0]
+def _items_kbps(items):
+    vals = [k for k in (est_kbps(it) for it in items) if k > 0]
     return sum(vals) / len(vals) if vals else 0.0
+
+
+def group_kbps(g):
+    return _items_kbps(g.get("items", []))
 
 
 def pick_by_quality_ladder(groups):
@@ -656,45 +786,55 @@ def pick_by_quality_ladder(groups):
       3. high-quality lossy (mp3/aac/.m4a-aac) at >= LOSSY_MIN_SCORE
       else: low_quality_only / no_source
 
-    'info' carries the chosen format + measured bitrate so callers can log and
-    record exactly what a fallback landed on.
+    Items flagged `below_floor: true` by Soulbeet are skipped. 'info' carries the
+    chosen format + measured bitrate so callers can log and record exactly what a
+    fallback landed on.
     """
     if not groups:
         return "no_source", [], None
 
+    def eligible(items):
+        return [it for it in (items or []) if not it.get("below_floor")]
+
+    def qstr(obj):
+        return (obj.get("quality") or "").lower()
+
     # --- tier 1: FLAC ---
-    flac = [g for g in groups if g.get("quality") == "flac"]
+    flac = [g for g in groups if qstr(g) == "flac"]
     if flac:
-        flac.sort(key=lambda g: (g.get("score", 0), g.get("item_count", 0)), reverse=True)
-        items = [it for it in flac[0].get("items", []) if it.get("quality") == "flac"]
-        if items:
-            return "queued_flac", items, {"fmt": "flac", "kbps": round(group_kbps(flac[0]))}
+        flac.sort(key=lambda g: (g.get("score") or 0, g.get("item_count") or 0), reverse=True)
+        for g in flac:
+            items = [it for it in eligible(g.get("items", [])) if qstr(it) == "flac"]
+            if items:
+                return "queued_flac", items, {"fmt": "flac", "kbps": round(_items_kbps(items))}
 
     # --- tier 2: ALAC (.m4a at lossless bitrate) -- lossless, so preferred over any lossy ---
-    alac = [g for g in groups
-            if g.get("quality") == "m4a" and group_kbps(g) >= ALAC_MIN_KBPS]
+    alac = [g for g in groups if qstr(g) == "m4a"]
     if alac:
-        alac.sort(key=lambda g: (g.get("score", 0), g.get("item_count", 0)), reverse=True)
-        items = [it for it in alac[0].get("items", [])
-                 if it.get("quality") == "m4a" and est_kbps(it) >= ALAC_MIN_KBPS]
-        if items:
-            return "queued_alac", items, {"fmt": "alac", "kbps": round(group_kbps(alac[0]))}
+        alac.sort(key=lambda g: (g.get("score") or 0, g.get("item_count") or 0), reverse=True)
+        for g in alac:
+            elig = [it for it in eligible(g.get("items", [])) if qstr(it) == "m4a"]
+            if _items_kbps(elig) < ALAC_MIN_KBPS:
+                continue
+            items = [it for it in elig if est_kbps(it) >= ALAC_MIN_KBPS]
+            if items:
+                return "queued_alac", items, {"fmt": "alac", "kbps": round(_items_kbps(items))}
 
     # --- tier 3: high-quality lossy ---
-    lossy = [g for g in groups if g.get("quality") in LOSSY_EXTS]
+    lossy = [g for g in groups if qstr(g) in LOSSY_EXTS]
     if lossy:
-        lossy.sort(key=lambda g: g.get("score", 0), reverse=True)
+        lossy.sort(key=lambda g: (g.get("score") or 0), reverse=True)
         for g in lossy:
-            items = [it for it in g.get("items", [])
-                     if it.get("quality") in LOSSY_EXTS
-                     and it.get("quality_score", 0) >= LOSSY_MIN_SCORE]
+            items = [it for it in eligible(g.get("items", []))
+                     if qstr(it) in LOSSY_EXTS
+                     and (it.get("quality_score") or 0) >= LOSSY_MIN_SCORE]
             # prefer explicit 320/V0 in filename ordering
             items.sort(key=lambda it: (
                 1 if re.search(r"320|v0", (it.get("title", "") or "").lower()) else 0,
-                it.get("quality_score", 0)), reverse=True)
+                it.get("quality_score") or 0), reverse=True)
             if items:
-                return "queued_lossy", items, {"fmt": g.get("quality"),
-                                               "kbps": round(group_kbps(g))}
+                return "queued_lossy", items, {"fmt": qstr(g),
+                                               "kbps": round(_items_kbps(items))}
         return "low_quality_only", [], None
 
     return "low_quality_only", [], None
@@ -1476,7 +1616,7 @@ def process_candidate(state, sb, secrets, row):
         res = sb.poll(sid)
         status, items, info = pick_by_quality_ladder(res.get("groups", []))
         if items:
-            sb.queue(items)
+            sb.queue(items, sid)
 
         # Document every non-FLAC outcome explicitly: what it fell back to and why.
         if info and status == "queued_alac":
@@ -1526,7 +1666,7 @@ def upgrade_one(state, sb, cand, cfg):
             return "no_flac"
         # Stage it, never straight into the library: nothing replaces a file you
         # already have until the swap script has verified it end to end.
-        sb.queue(items, target_folder=UPGRADE_FOLDER)
+        sb.queue(items, sid, target_folder=UPGRADE_FOLDER)
         state.upsert_upgrade(key, status="queued",
                              note=f"flac @ ~{(info or {}).get('kbps', 0)} kbps staged")
         log(f"  UPGRADE [{artist} - {album}]: {cand['codec']} @ ~{cand['kbps']} kbps "
@@ -1647,7 +1787,8 @@ def write_status(state, cfg, lib_bytes, track_count, free):
     ]
     status["staging_free_gb"] = round(free_gb(STAGING_PATH), 1)
     status["paused"] = bool(cfg["PAUSED"])
-    status["stop_reason"] = stop_reason(cfg, lib_bytes, track_count, free)
+    reason = stop_reason(cfg, lib_bytes, track_count, free)
+    status["stop_reason"] = reason.message if reason else None
     try:
         STATUS_JSON.write_text(json.dumps(status, indent=2))
     except OSError:
@@ -1657,14 +1798,53 @@ def write_status(state, cfg, lib_bytes, track_count, free):
          "queued_flac", "queued_alac", "queued_lossy", "lossless_pct", "pending")}))
 
 
+STOP_FREE_SPACE = "free_space"
+STOP_TARGET_TB = "target_tb"
+STOP_TARGET_TRACKS = "target_tracks"
+CAP_STOP_KINDS = frozenset({STOP_TARGET_TB, STOP_TARGET_TRACKS})
+
+
+class StopReason(collections.namedtuple("StopReason", ["kind", "message"])):
+    """Structured stop reason so main() can distinguish soft library caps from
+    hard safety floors without string matching."""
+
+    @property
+    def is_cap(self):
+        return self.kind in CAP_STOP_KINDS
+
+    def __str__(self):
+        return self.message
+
+
 def stop_reason(cfg, lib_bytes, track_count, free):
-    if lib_bytes / (1024 ** 4) >= cfg["TARGET_TB"]:
-        return f"reached target size {cfg['TARGET_TB']} TB"
-    if track_count >= cfg["TARGET_TRACKS"]:
-        return f"reached target tracks {cfg['TARGET_TRACKS']}"
+    # Check the hard free-space floor first so a low-disk condition is never
+    # masked by a soft size/track cap when FAVORITES_BYPASS_CAP is enabled.
     if free < cfg["MIN_FREE_GB"]:
-        return f"free space floor: {free:.0f} GB < {cfg['MIN_FREE_GB']} GB"
+        return StopReason(STOP_FREE_SPACE,
+                          f"free space floor: {free:.0f} GB < {cfg['MIN_FREE_GB']} GB")
+    if lib_bytes / (1024 ** 4) >= cfg["TARGET_TB"]:
+        return StopReason(STOP_TARGET_TB,
+                          f"reached target size {cfg['TARGET_TB']} TB")
+    if track_count >= cfg["TARGET_TRACKS"]:
+        return StopReason(STOP_TARGET_TRACKS,
+                          f"reached target tracks {cfg['TARGET_TRACKS']}")
     return None
+
+
+def favorite_min_priority(cfg):
+    """Minimum candidate priority treated as a favorite during cap bypass."""
+    return max(1, int(cfg.get("FAVORITE_PRIORITY", 100)))
+
+
+def should_bypass_cap_for_favorites(reason, cfg):
+    """True when discovery is stopped by a soft cap (TARGET_TB / TARGET_TRACKS)
+    and favorites should still sync and download."""
+    return bool(
+        reason is not None
+        and reason.is_cap
+        and cfg.get("FAVORITES_ENABLED", True)
+        and cfg.get("FAVORITES_BYPASS_CAP", True)
+    )
 
 
 def main():
@@ -1717,24 +1897,31 @@ def main():
         # getting full, so beets/mover can drain it (protects the cache SSD).
         staging_free = free_gb(STAGING_PATH)
         if staging_free < cfg["STAGING_MIN_FREE_GB"]:
+            busy.clear()
             log(f"Staging pool low ({staging_free:.0f} GB < {cfg['STAGING_MIN_FREE_GB']} GB); "
                 f"pausing downloads 2 min to let imports drain")
             time.sleep(120)
             continue
 
+        free = free_gb(FREE_SPACE_PATH)
         reason = stop_reason(cfg, lib_bytes, track_count, free)
+        favorites_only = False
         if reason:
-            busy.clear()
-            log(f"STOP CONDITION: {reason}. Idling 5 min (raise targets in the UI or "
-                f"config.env to resume).")
-            time.sleep(300)
-            last_measure = 0  # force re-measure after idle
-            continue
+            if should_bypass_cap_for_favorites(reason, cfg):
+                favorites_only = True
+            else:
+                busy.clear()
+                log(f"STOP CONDITION: {reason}. Idling 5 min (raise targets in the UI or "
+                    f"config.env to resume).")
+                time.sleep(300)
+                last_measure = 0  # force re-measure after idle
+                continue
 
-        # refresh taste signal periodically
-        last_refresh = int(state.get_meta("last_taste_refresh", "0"))
-        if time.time() - last_refresh > cfg["TASTE_REFRESH_MIN"] * 60:
-            refresh_taste(state, secrets, lastfm, exclude_set, cfg)
+        if not favorites_only:
+            # refresh taste signal periodically
+            last_refresh = int(state.get_meta("last_taste_refresh", "0"))
+            if time.time() - last_refresh > cfg["TASTE_REFRESH_MIN"] * 60:
+                refresh_taste(state, secrets, lastfm, exclude_set, cfg)
 
         # sync favorited artists' discographies + notice new releases
         last_fav = int(state.get_meta("last_favorites_sync", "0"))
@@ -1742,18 +1929,33 @@ def main():
                 time.time() - last_fav > cfg["FAVORITE_SYNC_HOURS"] * 3600:
             favorites_sync(state, secrets, mb, cfg, exclude_set)
 
-        # expand a few top-weighted artists into album candidates
-        for artist, weight in state.unexpanded_artists(limit=5):
-            expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set)
+        if not favorites_only:
+            # expand a few top-weighted artists into album candidates
+            for artist, weight in state.unexpanded_artists(limit=5):
+                expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set)
 
         # process a wave of pending candidates concurrently
-        batch = state.pending_candidates(limit=cfg["CONCURRENCY"] * 3)
-        if not batch:
-            busy.clear()
-            log("No pending candidates; refreshing taste and expanding more")
-            refresh_taste(state, secrets, lastfm, exclude_set, cfg)
-            time.sleep(10)
-            continue
+        if favorites_only:
+            batch = state.pending_candidates(
+                limit=cfg["CONCURRENCY"] * 3,
+                min_priority=favorite_min_priority(cfg),
+            )
+            if not batch:
+                busy.clear()
+                log(f"STOP CONDITION: {reason} (favorites synced, none pending). "
+                    f"Idling 5 min (raise targets in the UI or config.env to resume discovery).")
+                time.sleep(300)
+                last_measure = 0  # force re-measure after idle
+                continue
+            log(f"Cap reached ({reason}); processing {len(batch)} favorite candidate(s)")
+        else:
+            batch = state.pending_candidates(limit=cfg["CONCURRENCY"] * 3)
+            if not batch:
+                busy.clear()
+                log("No pending candidates; refreshing taste and expanding more")
+                refresh_taste(state, secrets, lastfm, exclude_set, cfg)
+                time.sleep(10)
+                continue
 
         busy.set()      # tells the upgrade loop to stay out of the way
         try:

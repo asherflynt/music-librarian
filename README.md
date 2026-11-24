@@ -240,6 +240,15 @@ When on, any artist you favourite gets their ENTIRE discography downloaded, and 
 
 Turning this off leaves existing downloads alone; it just stops new discography syncing.
 
+#### `FAVORITES_BYPASS_CAP`
+**Keep syncing favourites even after hitting size/track targets** · default `on` · on / off
+
+Lets favourited artists' discographies and new releases keep syncing and downloading even after the library reaches TARGET_TB or TARGET_TRACKS.
+
+On by default. The size and track targets stop ordinary discovery and exploration, not artists you explicitly starred. The hard free-space floor (MIN_FREE_GB), staging cache guard (STAGING_MIN_FREE_GB), and Pause still stop everything — favourites never bypass those.
+
+Turn this off if you want TARGET_TB and TARGET_TRACKS to act as a strict freeze on all downloads, including favourites.
+
 #### `FAVORITE_SYNC_HOURS`
 **How often to check favourites for new releases** · default `24` · 1 – 8760
 
