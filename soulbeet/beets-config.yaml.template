@@ -1,0 +1,75 @@
+# Soulbeet beets configuration template (beets 2.11.0).
+# Rendered to /mnt/user/appdata/soulbeet/config/config.yaml by soulbeet/install.sh.
+# Note: BEETS_CONFIG=/config/config.yaml replaces (does not merge) /app/beets_config.yaml.
+
+directory: /music
+
+pluginpath:
+  - /opt/beets-plugins
+  - /data/beets-plugins
+
+plugins: musicbrainz fetchart embedart decodecheck
+
+import:
+  timid: no
+  quiet_fallback: asis
+  move: yes
+
+# No `paths:` and no `musicbrainz:` block on purpose: the live config uses
+# beets' defaults (singletons -> Non-Album/$artist/$title, searchlimit 5), and
+# this template must not change where or how tracks are matched and filed.
+
+match:
+  strong_rec_thresh: 0.10
+  max_rec:
+    missing_tracks: strong
+    unmatched_tracks: strong
+  distance_weights:
+    missing_tracks: 0.1
+
+ui:
+  color: no
+
+# Path character sanitization: strip emoji/pictographs/dingbats/variation
+# selectors/ZWJ and collapse runs of spaces before beets 2.11's default rules.
+# The music signs ♭ ♮ ♯ (U+266D-266F) are deliberately kept: they appear in real
+# album and track names (e.g. "Op. 27 in C♯ minor").
+replace:
+  "[\U0001F000-\U0001FAFF\u2600-\u266C\u2670-\u27BF\u2B00-\u2BFF\u2300-\u23FF\uFE0F\u200D]+": ""
+  '\s{2,}': ' '
+  '[<>:\?\*\|]': _
+  '\"': _
+  '[\\/]': _
+  '^\.': _
+  '\.$': _
+  '[\x00-\x1f]': _
+  '^-': _
+  '\s+$': ''
+  '^\s+': ''
+
+fetchart:
+  auto: yes
+  lastfm_key: "${LASTFM_API_KEY}"
+  sources:
+    - filesystem
+    - coverart
+    - itunes
+    - amazon
+    - albumart
+    - lastfm
+    - spotify
+    - wikipedia
+
+embedart:
+  auto: yes
+  ifempty: yes
+  remove_art_file: no
+
+decodecheck:
+  enabled: yes
+  state_dir: /downloads/.decodecheck
+  quarantine_days: 14
+  ffmpeg: ffmpeg
+  min_check_s: 15
+  trunc_abs_s: 5
+  trunc_frac: 0.05

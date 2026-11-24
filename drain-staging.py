@@ -136,6 +136,14 @@ def beets_import(folder, singleton):
         return 1, "timed out after 300s"
 
 
+def staging_folders(root):
+    """Top-level staging folders to drain. Dot-directories are never touched:
+    /downloads/.decodecheck holds the decode-gate quarantine and rejects.jsonl
+    (no audio directly inside), which the 'no audio -> rmtree' rule would wipe."""
+    return sorted(d for d in os.listdir(root)
+                  if not d.startswith(".") and os.path.isdir(os.path.join(root, d)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -148,7 +156,7 @@ def main():
     lib = Library()
     log(f"library: {len(lib.by_album)} (artist, album) key(s)")
 
-    folders = sorted(d for d in os.listdir(DL) if os.path.isdir(os.path.join(DL, d)))
+    folders = staging_folders(DL)
     log(f"staging: {len(folders)} folder(s){'  [DRY RUN — nothing will change]' if args.dry_run else ''}")
 
     stats = {"deleted": 0, "imported": 0, "empty": 0, "kept": 0, "failed": 0}

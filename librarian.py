@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -69,6 +70,10 @@ TARGET_FOLDER = os.environ.get("TARGET_FOLDER", "/music")           # beets dest
 # so Navidrome doesn't index half-verified albums.
 UPGRADE_FOLDER = os.environ.get("UPGRADE_FOLDER", "/music/_upgrades")
 UPGRADE_DIRNAME = "_upgrades"
+DEFAULT_DECODE_REJECTS_PATH = os.environ.get(
+    "DECODE_REJECTS_PATH",
+    "/cluster/Media/slskd_downloads/.decodecheck/rejects.jsonl",
+)
 WEB_PORT = int(os.environ.get("WEB_PORT", "8730"))
 
 LOSSY_EXTS = {"mp3", "m4a", "aac"}
@@ -204,6 +209,11 @@ def load_config():
         "UPGRADE_MAX_PER_RUN": max(1, num("UPGRADE_MAX_PER_RUN", 10, int)),
         "UPGRADE_RECHECK_DAYS": max(1, num("UPGRADE_RECHECK_DAYS", 30, int)),
         "UPGRADE_ONLY_WHEN_IDLE": flag("UPGRADE_ONLY_WHEN_IDLE", "1"),
+        # decode gate (corrupt-file learning + bad-peer blocking)
+        "DECODE_REJECTS_PATH": (c.get("DECODE_REJECTS_PATH") or DEFAULT_DECODE_REJECTS_PATH).strip(),
+        "DECODE_MAX_RETRIES": max(0, num("DECODE_MAX_RETRIES", 3, int)),
+        "BAD_PEER_STRIKES": max(1, num("BAD_PEER_STRIKES", 3, int)),
+        "BAD_PEER_DAYS": max(1, num("BAD_PEER_DAYS", 90, int)),
     }
 
 
@@ -230,7 +240,7 @@ def db_connect():
         CREATE TABLE IF NOT EXISTS candidates (
             key TEXT PRIMARY KEY,       -- normalized 'artist|album' or 'artist|track'
             artist TEXT, album TEXT, kind TEXT,
-            status TEXT DEFAULT 'pending',   -- pending|queued_flac|queued_alac|queued_lossy|no_source|low_quality_only|no_meta|error|exists
+            status TEXT DEFAULT 'pending',   -- pending|queued_flac|queued_alac|queued_lossy|no_source|low_quality_only|no_meta|error|exists|corrupt_only
             fmt TEXT,                   -- actual format chosen: flac|alac|mp3|m4a|aac
             kbps INTEGER,               -- measured bitrate of what was queued
             updated_at INTEGER DEFAULT 0
@@ -287,6 +297,52 @@ def db_connect():
             rg_id TEXT PRIMARY KEY,
             artist TEXT, album TEXT, released TEXT, found_at INTEGER
         );
+
+        -- Files queued to Soulbeet, so decode-gate rejections can be attributed
+        -- back to the Soulseek peer and candidate/upgrade that queued them.
+        CREATE TABLE IF NOT EXISTS downloads (
+            id INTEGER PRIMARY KEY,
+            ts INTEGER DEFAULT 0,
+            kind TEXT,                  -- 'candidate' | 'upgrade'
+            ref_key TEXT,               -- candidate key or upgrade key
+            username TEXT,              -- Soulseek peer username
+            filename TEXT,              -- full remote filename
+            basename TEXT,              -- last path component of filename
+            remote_dir TEXT,            -- last directory component of filename
+            search_id TEXT,
+            norm_basename TEXT,         -- slskd_name_key(basename), what rejects match on
+            norm_remote_dir TEXT        -- slskd_name_key(remote_dir)
+        );
+        CREATE INDEX IF NOT EXISTS idx_downloads_basename ON downloads(basename);
+        CREATE INDEX IF NOT EXISTS idx_downloads_ts ON downloads(ts);
+
+        -- Peer-attributed corrupt downloads learned from the decode gate.
+        CREATE TABLE IF NOT EXISTS bad_sources (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            ref_key TEXT,
+            reason TEXT,
+            basename TEXT,
+            ts INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_bad_sources_ref_key ON bad_sources(ref_key);
+        CREATE INDEX IF NOT EXISTS idx_bad_sources_username_ts ON bad_sources(username, ts);
+
+        -- Ingested rejects.jsonl events, deduplicated by (task_id, basename) so
+        -- re-reads never double-count or burn extra retries. Also backs status stats.
+        CREATE TABLE IF NOT EXISTS decode_rejects (
+            task_id TEXT,
+            basename TEXT,
+            ts INTEGER DEFAULT 0,
+            reason TEXT,
+            matched INTEGER DEFAULT 0,
+            username TEXT,
+            ref_key TEXT,
+            kind TEXT,
+            requeued INTEGER DEFAULT 0, -- checker_unavailable: 0 waiting, 2 re-pended, 1 handled
+            PRIMARY KEY (task_id, basename)
+        );
+        CREATE INDEX IF NOT EXISTS idx_decode_rejects_ts ON decode_rejects(ts);
         """
     )
     _migrate(conn)
@@ -314,13 +370,48 @@ def _migrate(conn):
         ("candidates", "priority", "INTEGER DEFAULT 0"),
         # Cap how many times an errored candidate is automatically retried.
         ("candidates", "attempts", "INTEGER DEFAULT 0"),
+        # Cap how many times a decode-rejected candidate is re-queued from other peers.
+        ("candidates", "decode_retries", "INTEGER DEFAULT 0"),
+        # Decode-gate matching keys that survive slskd's filename rewrites.
+        ("downloads", "norm_basename", "TEXT"),
+        ("downloads", "norm_remote_dir", "TEXT"),
+        ("decode_rejects", "requeued", "INTEGER DEFAULT 0"),
     ):
-        if name not in cols(table):
+        have = cols(table)
+        if not have:
+            continue  # table not created here (bare legacy db in tests)
+        if name not in have:
             log(f"Migrating state.db: adding {table}.{name}")
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_pending "
                  "ON candidates(status, priority DESC, updated_at)")
+    if "norm_basename" in cols("downloads"):
+        for rid, bn, rd in conn.execute(
+                "SELECT id, basename, remote_dir FROM downloads "
+                "WHERE norm_basename IS NULL").fetchall():
+            conn.execute("UPDATE downloads SET norm_basename=?, norm_remote_dir=? "
+                         "WHERE id=?", (slskd_name_key(bn), slskd_name_key(rd), rid))
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_norm_basename "
+                     "ON downloads(norm_basename)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_norm_remote_dir "
+                     "ON downloads(norm_remote_dir)")
     conn.commit()
+
+
+# slskd writes a remote file under a local name it has rewritten: characters that
+# are invalid on Windows/Linux become '_' ("Road to Hell: Intro" -> "Road to
+# Hell_ Intro"), and a name that already exists gets "_<ticks>" before the
+# extension. A reject carries the local name; downloads rows carry the remote one.
+_SLSKD_BAD_CHARS_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_SLSKD_TICKS_RE = re.compile(r"_\d{15,19}(?=(\.[^.]*)?$)")
+
+
+def slskd_name_key(name):
+    """Comparison key for a file/dir name on either side of slskd's rename."""
+    s = unicodedata.normalize("NFC", (name or "").strip())
+    s = _SLSKD_BAD_CHARS_RE.sub("_", s)
+    s = _SLSKD_TICKS_RE.sub("", s)
+    return s.casefold()
 
 
 def norm(s):
@@ -609,6 +700,325 @@ class State:
                 "SELECT artist, album, released, found_at FROM new_releases "
                 "ORDER BY found_at DESC LIMIT ?", (limit,)).fetchall()
 
+    # -- decode gate: downloads, bad_sources, rejects -------------------------
+    def record_downloads(self, kind, ref_key, items, search_id, ts=None):
+        """One row per queued item, so a decode-gate reject can be traced back to
+        the peer that served it and the candidate/upgrade that asked for it."""
+        now = int(time.time() if ts is None else ts)
+        rows = []
+        for it in items or ():
+            if not isinstance(it, dict):
+                continue
+            filename = item_filename(it)
+            basename, remote_dir = split_remote_filename(filename)
+            rows.append((now, kind, ref_key, item_peer(it), filename,
+                         basename, remote_dir, search_id or "",
+                         slskd_name_key(basename), slskd_name_key(remote_dir)))
+        if not rows:
+            return 0
+        with self.lock:
+            self.conn.executemany(
+                "INSERT INTO downloads(ts, kind, ref_key, username, filename, "
+                "basename, remote_dir, search_id, norm_basename, norm_remote_dir) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
+            self.conn.commit()
+        return len(rows)
+
+    def prune_downloads(self, older_than_days=30, now=None):
+        now = int(time.time() if now is None else now)
+        cutoff = now - max(1, int(older_than_days)) * 86400
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM downloads WHERE ts < ?", (cutoff,))
+            self.conn.commit()
+            return cur.rowcount
+
+    @staticmethod
+    def _download_row(r):
+        return {
+            "id": r[0],
+            "ts": r[1],
+            "kind": r[2],
+            "ref_key": r[3],
+            "username": r[4] or "",
+            "filename": r[5] or "",
+            "basename": r[6] or "",
+            "remote_dir": r[7] or "",
+            "search_id": r[8] or "",
+        }
+
+    def match_download(self, basename, staging_parent="", reject_ts=None, window_days=7,
+                       tag_keys=()):
+        """Attribute a rejected local file to the downloads row that queued it.
+
+        Names are compared with slskd_name_key() on both sides, so slskd's ':'->'_'
+        and "_<ticks>" rewrites still match. Among rows with that basename (inside
+        `window_days`, with a small clock-skew allowance so a later retry from
+        another peer is not blamed for an older reject):
+          1. the most recent row whose remote_dir matches the staging parent;
+          2. else the most recent row, but only if every row is for one ref_key;
+          3. else the most recent row whose ref_key is in `tag_keys` (candidate
+             keys built from the reject's artist/album tags).
+        Otherwise it is ambiguous and None is returned rather than blaming a peer.
+
+        If no basename matches, rows from the same remote dir can still identify
+        the album when they are all for a single ref_key; then the result's
+        username is "" (album retried, no peer blamed).
+        """
+        nb = slskd_name_key(basename)
+        if not nb:
+            return None
+        np_ = slskd_name_key(staging_parent)
+        ref_ts = int(time.time() if reject_ts is None else reject_ts)
+        cutoff = ref_ts - max(1, int(window_days)) * 86400
+        upper = ref_ts + 300
+        cols = ("SELECT id, ts, kind, ref_key, username, filename, basename, "
+                "       remote_dir, search_id, norm_remote_dir FROM downloads ")
+        with self.lock:
+            rows = self.conn.execute(
+                cols + "WHERE norm_basename=? AND ts >= ? AND ts <= ? "
+                "ORDER BY ts DESC, id DESC",
+                (nb, cutoff, upper),
+            ).fetchall()
+            dir_rows = []
+            if not rows and np_:
+                dir_rows = self.conn.execute(
+                    cols + "WHERE norm_remote_dir=? AND ts >= ? AND ts <= ? "
+                    "ORDER BY ts DESC, id DESC",
+                    (np_, cutoff, upper),
+                ).fetchall()
+        if rows:
+            if np_:
+                for r in rows:
+                    if r[9] == np_:
+                        return self._download_row(r)
+            if len({r[3] for r in rows}) == 1:
+                return self._download_row(rows[0])
+            tagged = [r for r in rows if r[3] in set(tag_keys or ())]
+            if tagged:
+                return self._download_row(tagged[0])
+            return None
+        if dir_rows and len({r[3] for r in dir_rows}) == 1:
+            m = self._download_row(dir_rows[0])
+            m["username"] = ""
+            return m
+        return None
+
+    def add_bad_source(self, username, ref_key, reason, basename, ts=None):
+        if not username:
+            return
+        now = int(time.time() if ts is None else ts)
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO bad_sources(username, ref_key, reason, basename, ts) "
+                "VALUES(?,?,?,?,?)",
+                (username, ref_key or "", reason or "unknown", basename or "", now),
+            )
+            self.conn.commit()
+
+    def global_blocked_peers(self, strikes=3, days=90, now=None):
+        """Peers with >= `strikes` bad downloads in the last `days`.
+
+        A strike is one distinct ref_key (album/upgrade), not one file: a whole bad
+        album writes one bad_sources row per broken track, and one bad rip should
+        not ban a peer everywhere on its own.
+        """
+        now = int(time.time() if now is None else now)
+        cutoff = now - max(1, int(days)) * 86400
+        with self.lock:
+            return frozenset(
+                r[0] for r in self.conn.execute(
+                    "SELECT username FROM bad_sources "
+                    "WHERE ts >= ? AND username IS NOT NULL AND username != '' "
+                    "GROUP BY username HAVING COUNT(DISTINCT ref_key) >= ?",
+                    (cutoff, max(1, int(strikes))),
+                )
+            )
+
+    def blocked_peers(self, ref_key, strikes=3, days=90, now=None):
+        """Peers never to pick for `ref_key`: any peer that already served a bad
+        file for it (no expiry), plus globally struck-out peers."""
+        per_key = set()
+        if ref_key:
+            with self.lock:
+                per_key = {
+                    r[0] for r in self.conn.execute(
+                        "SELECT DISTINCT username FROM bad_sources "
+                        "WHERE ref_key=? AND username IS NOT NULL AND username != ''",
+                        (ref_key,),
+                    )
+                }
+        return frozenset(per_key) | self.global_blocked_peers(strikes, days, now)
+
+    def has_decode_reject(self, task_id, basename):
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT 1 FROM decode_rejects WHERE task_id=? AND basename=? LIMIT 1",
+                (task_id, basename),
+            ).fetchone()
+        return bool(r)
+
+    def task_already_matched_key(self, task_id, ref_key):
+        """True if an earlier bad file from the same import task already bumped `ref_key`."""
+        if not task_id or not ref_key:
+            return False
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT 1 FROM decode_rejects "
+                "WHERE task_id=? AND ref_key=? AND matched=1 "
+                "AND reason != 'checker_unavailable' LIMIT 1",
+                (task_id, ref_key),
+            ).fetchone()
+        return bool(r)
+
+    def record_decode_reject(self, task_id, basename, ts, reason, matched,
+                             username="", ref_key="", kind=""):
+        """Insert a reject event if not already seen. Returns True if newly inserted."""
+        with self.lock:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO decode_rejects("
+                "task_id, basename, ts, reason, matched, username, ref_key, kind"
+                ") VALUES(?,?,?,?,?,?,?,?)",
+                (task_id, basename, int(ts), reason, int(bool(matched)),
+                 username or "", ref_key or "", kind or ""),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def candidate_info(self, key):
+        with self.lock:
+            return self.conn.execute(
+                "SELECT artist, album, status, COALESCE(decode_retries, 0) "
+                "FROM candidates WHERE key=?",
+                (key,),
+            ).fetchone()
+
+    def upgrade_info(self, key):
+        with self.lock:
+            return self.conn.execute(
+                "SELECT artist, album, status FROM upgrades WHERE key=?",
+                (key,),
+            ).fetchone()
+
+    def handle_candidate_decode_reject(self, key, max_retries):
+        """Re-queue candidate if under max_retries, else mark corrupt_only.
+
+        Returns (new_status, decode_retries) or (None, 0) if key does not exist.
+        """
+        max_retries = max(0, int(max_retries))
+        now = int(time.time())
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(decode_retries, 0) FROM candidates WHERE key=?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return None, 0
+            cur_retries = int(row[0] or 0)
+            if cur_retries < max_retries:
+                new_retries = cur_retries + 1
+                # updated_at=0 puts it at the front of its priority class
+                # (pending is ordered priority DESC, updated_at ASC), so the
+                # retry happens in the next wave instead of behind the backlog.
+                self.conn.execute(
+                    "UPDATE candidates SET status='pending', decode_retries=?, "
+                    "updated_at=0 WHERE key=?",
+                    (new_retries, key),
+                )
+                self.conn.commit()
+                return "pending", new_retries
+            self.conn.execute(
+                "UPDATE candidates SET status='corrupt_only', updated_at=? WHERE key=?",
+                (now, key),
+            )
+            self.conn.commit()
+            return "corrupt_only", cur_retries
+
+    def checker_unavailable_pending(self):
+        """checker_unavailable rejects whose candidate/upgrade was not re-pended yet."""
+        with self.lock:
+            return self.conn.execute(
+                "SELECT task_id, basename, ts, ref_key, kind FROM decode_rejects "
+                "WHERE reason='checker_unavailable' AND matched=1 "
+                "AND COALESCE(requeued, 0)=0 AND ref_key != ''",
+            ).fetchall()
+
+    def repend_after_checker_outage(self, task_id, basename, ref_key, kind, max_repends=3):
+        """Put a checker_unavailable item back in line without consuming a decode
+        retry or blaming a peer. Returns True if a candidate went back to pending.
+
+        Capped at `max_repends` per ref_key, so a file that reliably kills the
+        checker (e.g. OOM) cannot cause an endless re-download loop."""
+        changed = False
+        with self.lock:
+            prior = self.conn.execute(
+                "SELECT COUNT(*) FROM decode_rejects WHERE ref_key=? AND requeued=2",
+                (ref_key,)).fetchone()[0]
+            if prior >= max(0, int(max_repends)):
+                self.conn.execute(
+                    "UPDATE decode_rejects SET requeued=1 WHERE task_id=? AND basename=?",
+                    (task_id, basename))
+                self.conn.commit()
+                return False
+            if kind == "candidate":
+                cur = self.conn.execute(
+                    "UPDATE candidates SET status='pending', updated_at=0 "
+                    "WHERE key=? AND status LIKE 'queued_%'", (ref_key,))
+                changed = cur.rowcount > 0
+            elif kind == "upgrade":
+                self.conn.execute(
+                    "UPDATE upgrades SET status='failed', "
+                    "note='decode checker unavailable; retry later', updated_at=? "
+                    "WHERE key=? AND status='queued'", (int(time.time()), ref_key))
+            # 2 = re-pended (counts toward the cap), 1 = handled without re-pending
+            self.conn.execute(
+                "UPDATE decode_rejects SET requeued=? WHERE task_id=? AND basename=?",
+                (2 if changed else 1, task_id, basename))
+            self.conn.commit()
+        return changed
+
+    def decode_reject_stats(self, now=None):
+        now = int(time.time() if now is None else now)
+        cut_24h = now - 86400
+        cut_7d = now - 7 * 86400
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT ts, reason, matched FROM decode_rejects WHERE ts >= ?",
+                (cut_7d,),
+            ).fetchall()
+        by_reason_24h = {}
+        by_reason_7d = {}
+        matched_24h = unmatched_24h = 0
+        matched_7d = unmatched_7d = 0
+        checker_unavail_24h = 0
+        for ts, reason, matched in rows:
+            reason = reason or "unknown"
+            by_reason_7d[reason] = by_reason_7d.get(reason, 0) + 1
+            if matched:
+                matched_7d += 1
+            else:
+                unmatched_7d += 1
+            if ts >= cut_24h:
+                by_reason_24h[reason] = by_reason_24h.get(reason, 0) + 1
+                if matched:
+                    matched_24h += 1
+                else:
+                    unmatched_24h += 1
+                if reason == "checker_unavailable":
+                    checker_unavail_24h += 1
+        return {
+            "rejects_24h": matched_24h + unmatched_24h,
+            "rejects_7d": matched_7d + unmatched_7d,
+            "by_reason_24h": by_reason_24h,
+            "by_reason_7d": by_reason_7d,
+            "matched_24h": matched_24h,
+            "unmatched_24h": unmatched_24h,
+            "matched_7d": matched_7d,
+            "unmatched_7d": unmatched_7d,
+            "checker_unavailable_24h": checker_unavail_24h,
+        }
+
 
 # ----------------------------------------------------------------------------
 # Soulbeet client (auth + FLAC/lossy pipeline)
@@ -887,7 +1297,62 @@ def group_kbps(g):
     return _items_kbps(g.get("items", []))
 
 
-def pick_by_quality_ladder(groups):
+def _item_backend_data(item):
+    """Parse Soulbeet's JSON-encoded `backend_data` (slskd SearchResult) if present."""
+    if not isinstance(item, dict):
+        return {}
+    raw = item.get("backend_data")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            return {}
+    return {}
+
+
+def item_peer(item, group=None):
+    """Soulseek peer that serves a Soulbeet search-poll item.
+
+    Soulbeet puts the slskd username in `source` (and again in the JSON-encoded
+    `backend_data` as `username`); groups carry the same `source`.
+    """
+    if isinstance(item, dict):
+        v = item.get("source") or _item_backend_data(item).get("username")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    if isinstance(group, dict):
+        v = group.get("source")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def item_filename(item):
+    """Full remote filename of a search-poll item: Soulbeet's `id` is the slskd
+    filename (Windows-style backslashes); `backend_data.filename` is the fallback."""
+    if isinstance(item, dict):
+        v = item.get("id") or _item_backend_data(item).get("filename")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _split_path_parts(path):
+    return [p for p in re.split(r"[\\/]+", (path or "").strip()) if p]
+
+
+def split_remote_filename(filename):
+    """Return (basename, remote_dir) of a remote path, splitting on both '\\' and '/'."""
+    parts = _split_path_parts(filename)
+    if not parts:
+        return "", ""
+    return parts[-1], (parts[-2] if len(parts) >= 2 else "")
+
+
+def pick_by_quality_ladder(groups, blocked=frozenset()):
     """Return (status, items, info). Quality ladder, best first:
 
       1. FLAC                       -> lossless
@@ -895,12 +1360,36 @@ def pick_by_quality_ladder(groups):
       3. high-quality lossy (mp3/aac/.m4a-aac) at >= LOSSY_MIN_SCORE
       else: low_quality_only / no_source
 
-    Items flagged `below_floor: true` by Soulbeet are skipped. 'info' carries the
-    chosen format + measured bitrate so callers can log and record exactly what a
-    fallback landed on.
+    Items flagged `below_floor: true` by Soulbeet, or served by a peer in `blocked`,
+    are skipped. 'info' carries the chosen format + measured bitrate so callers can
+    log and record exactly what a fallback landed on.
     """
     if not groups:
         return "no_source", [], None
+
+    blocked_set = frozenset(
+        p.strip() for p in (blocked or ()) if isinstance(p, str) and p.strip()
+    )
+    if blocked_set:
+        filtered = []
+        for g in groups:
+            if not isinstance(g, dict) or (g.get("source") or "").strip() in blocked_set:
+                continue
+            raw_items = g.get("items") or []
+            kept = [it for it in raw_items
+                    if isinstance(it, dict) and item_peer(it, g) not in blocked_set]
+            if not kept:
+                continue
+            if len(kept) == len(raw_items):
+                filtered.append(g)
+            else:
+                ng = dict(g)
+                ng["items"] = kept
+                ng["item_count"] = len(kept)
+                filtered.append(ng)
+        groups = filtered
+        if not groups:
+            return "no_source", [], None
 
     def eligible(items):
         return [it for it in (items or []) if not it.get("below_floor")]
@@ -1702,7 +2191,7 @@ def expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set):
     return new
 
 
-def process_candidate(state, sb, secrets, row, backend_down=None):
+def process_candidate(state, sb, secrets, row, backend_down=None, cfg=None):
     key, artist, album, kind = row
     if backend_down is not None and backend_down.is_set():
         return "backend_down"
@@ -1728,9 +2217,11 @@ def process_candidate(state, sb, secrets, row, backend_down=None):
 
         sid = sb.start_search(album_obj, tracks)
         res = sb.poll(sid)
-        status, items, info = pick_by_quality_ladder(res.get("groups", []))
+        status, items, info = pick_by_quality_ladder(
+            res.get("groups", []), blocked=_blocked_for(state, key, cfg))
         if items:
             sb.queue(items, sid)
+            _record_downloads_safe(state, "candidate", key, items, sid)
 
         # Document every non-FLAC outcome explicitly: what it fell back to and why.
         if info and status == "queued_alac":
@@ -1755,6 +2246,352 @@ def process_candidate(state, sb, secrets, row, backend_down=None):
         log(f"  candidate error [{artist} - {album}]: {e}")
         state.set_status(key, "error")
         return "error"
+
+
+# ----------------------------------------------------------------------------
+# Decode gate — ingest beets decodecheck rejects, block bad peers, retry
+# ----------------------------------------------------------------------------
+DOWNLOADS_PRUNE_DAYS = 30
+DOWNLOADS_PRUNE_INTERVAL_SEC = 24 * 3600
+
+
+def _blocked_for(state, key, cfg):
+    cfg = cfg or {}
+    return state.blocked_peers(key, strikes=int(cfg.get("BAD_PEER_STRIKES", 3)),
+                               days=int(cfg.get("BAD_PEER_DAYS", 90)))
+
+
+def _record_downloads_safe(state, kind, key, items, sid):
+    """Record queued items; never let a bookkeeping failure turn an already-queued
+    download into an 'error' (which would re-queue it)."""
+    try:
+        state.record_downloads(kind, key, items, sid)
+    except Exception as e:
+        log(f"  decode gate: could not record downloads for {key}: {e}")
+
+
+def _load_rejects_cursor(state):
+    raw = state.get_meta("decode_rejects_cursor")
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _save_rejects_cursor(state, path_str, ino, offset, size):
+    state.set_meta("decode_rejects_cursor", json.dumps({
+        "path": path_str,
+        "ino": int(ino),
+        "offset": int(offset),
+        "size": int(size),
+    }))
+
+
+def _process_decode_reject(state, cfg, rec):
+    """Apply one parsed rejects.jsonl record. Returns True if newly processed."""
+    reason = str(rec.get("reason") or "unknown").strip() or "unknown"
+    staging_path = str(rec.get("staging_path") or "").strip()
+    sp_parts = _split_path_parts(staging_path)
+    basename = str(rec.get("basename") or (sp_parts[-1] if sp_parts else "")).strip()
+    staging_parent = sp_parts[-2] if len(sp_parts) >= 2 else ""
+    reject_ts = _parse_ts(rec.get("ts")) or int(time.time())
+    task_id = str(rec.get("task_id") or "").strip()
+    dedupe_task_id = task_id or f"notask:{reject_ts}:{staging_path}"
+
+    if state.has_decode_reject(dedupe_task_id, basename):
+        return False
+
+    tag_keys = []
+    if rec.get("album"):
+        for a in (rec.get("albumartist"), rec.get("artist")):
+            if a:
+                k = f"{norm(str(a))}|{norm(str(rec.get('album')))}|album"
+                if k not in tag_keys:
+                    tag_keys.append(k)
+    match = state.match_download(basename, staging_parent=staging_parent,
+                                 reject_ts=reject_ts, tag_keys=tag_keys)
+    if match is None:
+        # No downloads row identifies it: if the tags name a candidate that is
+        # still waiting on a download, retry that album anyway (no peer blamed).
+        for k in tag_keys:
+            info = state.candidate_info(k)
+            if info and str(info[2] or "").startswith("queued_"):
+                match = {"username": "", "ref_key": k, "kind": "candidate"}
+                break
+    matched = match is not None
+    peer = match["username"] if match else ""
+    ref_key = match["ref_key"] if match else ""
+    kind = match["kind"] if match else ""
+
+    already_acted_task = bool(
+        task_id and matched and state.task_already_matched_key(task_id, ref_key)
+    )
+
+    if not state.record_decode_reject(
+        dedupe_task_id, basename, reject_ts, reason, matched,
+        username=peer, ref_key=ref_key, kind=kind,
+    ):
+        return False
+
+    # Fail-closed checker errors are our own fault (e.g. missing ffmpeg), never
+    # the Soulseek peer's — do not block peers or consume retries.
+    if reason == "checker_unavailable":
+        detail = _truncate_body(str(rec.get("detail") or "decode checker unavailable"), 200)
+        log(f"DECODE CHECKER UNAVAILABLE ({basename or staging_path}): {detail} "
+            f"— not blocking peer or consuming retries; re-queued once the checker "
+            f"accepts a task again")
+        return True
+
+    if not matched:
+        artist = rec.get("artist") or rec.get("albumartist") or "?"
+        album = rec.get("album") or "?"
+        log(f"DECODE REJECT [unmatched {artist} - {album}]: {reason} ({basename})")
+        return True
+
+    if peer:
+        state.add_bad_source(peer, ref_key, reason, basename, ts=reject_ts)
+
+    peer_lbl = peer or "unknown"
+
+    if kind == "candidate":
+        cinfo = state.candidate_info(ref_key)
+        artist = (cinfo[0] if cinfo and cinfo[0] else rec.get("artist") or ref_key)
+        album = (cinfo[1] if cinfo and cinfo[1] else rec.get("album") or "")
+        label = f"{artist} - {album}" if album else artist
+        max_retries = int(cfg.get("DECODE_MAX_RETRIES", 3))
+        if already_acted_task:
+            log(f"DECODE REJECT [{label}]: {reason} from peer {peer_lbl} "
+                f"({basename}; same task)")
+        else:
+            new_status, retries = state.handle_candidate_decode_reject(ref_key, max_retries)
+            if new_status == "pending":
+                log(f"DECODE REJECT [{label}]: {reason} from peer {peer_lbl}; "
+                    f"retry {retries}/{max_retries}")
+            elif new_status == "corrupt_only":
+                log(f"DECODE REJECT [{label}]: {reason} from peer {peer_lbl}; "
+                    f"corrupt_only ({retries}/{max_retries} retries used)")
+            else:
+                log(f"DECODE REJECT [{label}]: {reason} from peer {peer_lbl} "
+                    f"(candidate not found)")
+        return True
+
+    if kind == "upgrade":
+        uinfo = state.upgrade_info(ref_key)
+        artist = (uinfo[0] if uinfo and uinfo[0] else rec.get("artist") or ref_key)
+        album = (uinfo[1] if uinfo and uinfo[1] else rec.get("album") or "")
+        label = f"{artist} - {album}" if album else artist
+        note = f"decode reject: {reason} from {peer_lbl}"
+        state.upsert_upgrade(ref_key, status="failed", note=note)
+        log(f"DECODE REJECT [upgrade {label}]: {reason} from peer {peer_lbl}; "
+            f"marked failed")
+        return True
+
+    log(f"DECODE REJECT [{kind}:{ref_key}]: {reason} from peer {peer_lbl} ({basename})")
+    return True
+
+
+def ingest_decode_rejects(state, cfg):
+    """Incrementally read new lines from DECODE_REJECTS_PATH and learn from them.
+
+    Tracks (path, inode, byte_offset, size) in meta so steady-state polling is one
+    stat() call. Handles missing files, rotation/truncation, partial trailing lines
+    without a newline, and malformed JSON lines cleanly.
+    """
+    path_str = (cfg.get("DECODE_REJECTS_PATH") or DEFAULT_DECODE_REJECTS_PATH).strip()
+    if not path_str:
+        return 0
+    path = Path(path_str)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return 0
+
+    ino = st.st_ino
+    size = st.st_size
+    cur = _load_rejects_cursor(state)
+    same_file = (cur.get("path") == path_str and cur.get("ino") == ino)
+    offset = int(cur.get("offset", 0)) if same_file else 0
+    if size < offset:
+        offset = 0  # truncated in place
+
+    if same_file and size == offset and cur.get("size") == size:
+        return 0
+
+    processed = 0
+    new_offset = offset
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            while True:
+                raw = f.readline()
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    # Incomplete line mid-write: wait for the trailing newline next loop.
+                    break
+                new_offset += len(raw)
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError as e:
+                    log(f"Decode gate: skipping malformed JSON line in {path}: {e}")
+                    continue
+                if not isinstance(rec, dict):
+                    log(f"Decode gate: skipping non-object JSON line in {path}")
+                    continue
+                try:
+                    if _process_decode_reject(state, cfg, rec):
+                        processed += 1
+                except Exception as e:  # one odd record must not wedge the reader
+                    log(f"Decode gate: failed to apply reject line in {path}: {e}")
+    except OSError as e:
+        log(f"Decode gate: failed reading {path}: {e}")
+        return processed
+
+    if new_offset != offset or not same_file or cur.get("size") != size:
+        _save_rejects_cursor(state, path_str, ino, new_offset, size)
+    return processed
+
+
+def checker_recovered_since(checked_path):
+    """ts of the newest accepted task in checked.jsonl (tail only), or 0."""
+    p = Path(checked_path)
+    newest = 0
+    try:
+        size = p.stat().st_size
+        with open(p, "rb") as f:
+            if size > 256 * 1024:
+                f.seek(size - 256 * 1024)
+                f.readline()
+            for raw in f:
+                try:
+                    rec = json.loads(raw.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    newest = max(newest, _parse_ts(rec.get("ts")))
+    except OSError:
+        return 0
+    return newest
+
+
+def repend_checker_unavailable(state, cfg):
+    """Re-pend candidates whose download was dropped while the checker was
+    broken, once checked.jsonl shows it accepting tasks again (a later accepted
+    line). Waiting for that proof avoids a re-download loop during an outage."""
+    rows = state.checker_unavailable_pending()
+    if not rows:
+        return 0
+    rejects_path = Path((cfg.get("DECODE_REJECTS_PATH") or DEFAULT_DECODE_REJECTS_PATH).strip())
+    recovered = checker_recovered_since(rejects_path.parent / "checked.jsonl")
+    n = 0
+    for task_id, basename, ts, ref_key, kind in rows:
+        if recovered <= int(ts or 0):
+            continue
+        if state.repend_after_checker_outage(
+                task_id, basename, ref_key, kind,
+                max_repends=int(cfg.get("DECODE_MAX_RETRIES", 3))):
+            n += 1
+            log(f"Decode gate: checker works again; re-queued {ref_key} "
+                f"(dropped as checker_unavailable)")
+    return n
+
+
+def maybe_prune_downloads(state, now=None, older_than_days=DOWNLOADS_PRUNE_DAYS):
+    """Prune downloads rows older than 30 days at most once per day."""
+    now = int(time.time() if now is None else now)
+    raw_last = state.get_meta("last_downloads_prune")
+    if raw_last is not None and now - int(raw_last) < DOWNLOADS_PRUNE_INTERVAL_SEC:
+        return 0
+    removed = state.prune_downloads(older_than_days=older_than_days, now=now)
+    state.set_meta("last_downloads_prune", now)
+    if removed:
+        log(f"Decode gate: pruned {removed} downloads row(s) older than {older_than_days}d")
+    return removed
+
+
+def count_checked_accepted(path, since_ts):
+    """Count accepted tasks in checked.jsonl with ts >= since_ts, or None if absent."""
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    max_tail = 2 * 1024 * 1024
+    seen_tasks = set()
+    count = 0
+    try:
+        with open(p, "rb") as f:
+            if st.st_size > max_tail:
+                f.seek(st.st_size - max_tail)
+                f.readline()  # discard first partial line
+            for raw in f:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if _parse_ts(rec.get("ts")) < since_ts:
+                    continue
+                tid = rec.get("task_id")
+                if tid:
+                    if tid in seen_tasks:
+                        continue
+                    seen_tasks.add(tid)
+                count += 1
+    except OSError:
+        return None
+    return count
+
+
+def decode_gate_status(state, cfg, now=None):
+    """Build the `decode_gate` section of status.json."""
+    now = int(time.time() if now is None else now)
+    rejects_path = Path((cfg.get("DECODE_REJECTS_PATH") or DEFAULT_DECODE_REJECTS_PATH).strip())
+    gate_dir = rejects_path.parent
+    dir_missing = not gate_dir.is_dir()
+
+    stats = state.decode_reject_stats(now=now)
+    strikes = int(cfg.get("BAD_PEER_STRIKES", 3))
+    days = int(cfg.get("BAD_PEER_DAYS", 90))
+    blocked_peers = len(state.global_blocked_peers(strikes=strikes, days=days, now=now))
+    accepted_24h = count_checked_accepted(gate_dir / "checked.jsonl", since_ts=now - 86400)
+
+    checker_unavail_24h = stats["checker_unavailable_24h"]
+    checker_warning = bool(dir_missing or checker_unavail_24h > 0)
+    if dir_missing:
+        warning_reason = (f"decode gate not installed: {gate_dir} is missing, so "
+                          f"corrupt downloads are not being checked")
+    elif checker_unavail_24h > 0:
+        warning_reason = f"decode checker unavailable ({checker_unavail_24h}x in last 24h)"
+    else:
+        warning_reason = None
+
+    return {
+        "rejects_24h": stats["rejects_24h"],
+        "rejects_7d": stats["rejects_7d"],
+        "matched": stats["matched_7d"],
+        "unmatched": stats["unmatched_7d"],
+        "by_reason_24h": stats["by_reason_24h"],
+        "by_reason_7d": stats["by_reason_7d"],
+        "matched_24h": stats["matched_24h"],
+        "unmatched_24h": stats["unmatched_24h"],
+        "matched_7d": stats["matched_7d"],
+        "unmatched_7d": stats["unmatched_7d"],
+        "blocked_peers": blocked_peers,
+        "accepted_24h": accepted_24h,
+        "checker_warning": checker_warning,
+        "checker_warning_reason": warning_reason,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -1785,13 +2622,15 @@ def upgrade_one(state, sb, cand, cfg):
             return "no_flac"
         sid = sb.start_search(results[0], [])
         res = sb.poll(sid)
-        status, items, info = pick_by_quality_ladder(res.get("groups", []))
+        status, items, info = pick_by_quality_ladder(
+            res.get("groups", []), blocked=_blocked_for(state, key, cfg))
         if status != "queued_flac" or not items:
             record("no_flac", f"best available was {status}")
             return "no_flac"
         # Stage it, never straight into the library: nothing replaces a file you
         # already have until the swap script has verified it end to end.
         sb.queue(items, sid, target_folder=UPGRADE_FOLDER)
+        _record_downloads_safe(state, "upgrade", key, items, sid)
         record("queued", f"flac @ ~{(info or {}).get('kbps', 0)} kbps staged")
         log(f"  UPGRADE [{artist} - {album}]: {cand['codec']} @ ~{cand['kbps']} kbps "
             f"-> FLAC staged for verification")
@@ -1878,6 +2717,7 @@ def write_status(state, cfg, lib_bytes, track_count, free):
         "no_meta": counts.get("no_meta", 0),
         "exists": counts.get("exists", 0),
         "error": counts.get("error", 0),
+        "corrupt_only": counts.get("corrupt_only", 0),
         "pending": counts.get("pending", 0),
         # exactly what fell back to what, most recent first
         "recent_fallbacks": [
@@ -1917,6 +2757,11 @@ def write_status(state, cfg, lib_bytes, track_count, free):
         for (name, display, mbid, src, _add, ls, _k, at, ah, note) in state.favorites()
     ]
     status["staging_free_gb"] = round(free_gb(STAGING_PATH), 1)
+    try:
+        status["decode_gate"] = decode_gate_status(state, cfg)
+    except Exception as e:
+        log(f"decode gate status failed (non-fatal): {e}")
+        status["decode_gate"] = None
     status["paused"] = bool(cfg["PAUSED"])
     reason = stop_reason(cfg, lib_bytes, track_count, free)
     status["stop_reason"] = reason.message if reason else None
@@ -2056,6 +2901,15 @@ def main():
             last_measure = time.time()
             write_status(state, cfg, lib_bytes, track_count, free)
 
+        # Learn from the decode gate every iteration (cheap: one stat() when idle),
+        # even while paused, so a rejected album is re-queued from another peer.
+        try:
+            ingest_decode_rejects(state, cfg)
+            repend_checker_unavailable(state, cfg)
+            maybe_prune_downloads(state)
+        except Exception as e:
+            log(f"decode gate ingest error (non-fatal): {e}")
+
         if cfg["PAUSED"]:
             busy.clear()
             log("PAUSED via config.env; sleeping 60s")
@@ -2135,7 +2989,7 @@ def main():
             with ThreadPoolExecutor(max_workers=cfg["CONCURRENCY"]) as ex:
                 results = list(ex.map(
                     lambda r: process_candidate(state, sb, secrets, r,
-                                                backend_down=backend_down),
+                                                backend_down=backend_down, cfg=cfg),
                     batch,
                 ))
         finally:

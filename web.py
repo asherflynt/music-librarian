@@ -55,6 +55,9 @@ SETTINGS = {
     "UPGRADE_MAX_PER_RUN":      ("int", 1, 1000),
     "UPGRADE_RECHECK_DAYS":     ("int", 1, 3650),
     "UPGRADE_ONLY_WHEN_IDLE":   ("bool", 0, 1),
+    "DECODE_MAX_RETRIES":       ("int", 0, 20),
+    "BAD_PEER_STRIKES":         ("int", 1, 50),
+    "BAD_PEER_DAYS":            ("int", 1, 3650),
 }
 
 # Plain-English explanation of every setting, shown as a hover box in the UI.
@@ -290,6 +293,30 @@ HELP = {
         "On by default. Upgrades and normal downloads compete for the same Soulseek "
         "peers and the same bandwidth; upgrades are a nice-to-have, so they wait rather "
         "than slow down music you don't have yet."),
+
+    "DECODE_MAX_RETRIES": (
+        "Retries from other peers after a corrupt download",
+        "How many times the librarian will re-queue an album after the decode gate "
+        "rejects a corrupt or truncated download.\n\n"
+        "The peer that served the bad file is blocked for that album immediately, so "
+        "each retry tries a different Soulseek peer. Once an album uses up this many "
+        "retries, it is marked corrupt_only so it stops churning the queue.\n\n"
+        "Set to 0 to never automatically retry rejected downloads."),
+    "BAD_PEER_STRIKES": (
+        "Bad albums before blocking a Soulseek peer everywhere",
+        "How many different albums a Soulseek peer can serve corrupt or truncated "
+        "files for within BAD_PEER_DAYS before the librarian stops picking that peer "
+        "for ANY album. Several bad tracks from the same album count once.\n\n"
+        "A peer is already blocked immediately for the specific album it broke. This "
+        "global threshold catches peers whose whole shared collection is damaged or "
+        "re-encoded junk, without permanently banning a good peer over one bad rip.\n\n"
+        "Lower it (e.g. 2) to cut off bad peers faster; raise it to be more forgiving."),
+    "BAD_PEER_DAYS": (
+        "How many days a peer's bad-file strikes stay on record",
+        "The rolling window for counting a peer's strikes toward BAD_PEER_STRIKES.\n\n"
+        "Rejections older than this many days stop counting toward a global block, so "
+        "a peer who fixes their library isn't banished forever. Per-album blocks stay "
+        "in place so the librarian won't re-pull the same broken copy."),
 }
 
 CTX = {}
@@ -737,6 +764,16 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:
     </div>
 
     <div class="card">
+      <h2>Decode gate</h2>
+      <div id="dgwarn" class="banner pause" style="margin-bottom:10px"></div>
+      <div class="row"><span class="sub">Accepted (24h)</span><b id="dgacc">–</b></div>
+      <div class="row"><span class="sub">Rejected (24h / 7d)</span><b id="dgrej">–</b></div>
+      <div class="row"><span class="sub">Matched / unmatched (7d)</span><span class="sub" id="dgmatch">–</span></div>
+      <div class="row"><span class="sub">Blocked peers</span><b id="dgpeers">–</b></div>
+      <table id="dgreasons" style="margin-top:8px"></table>
+    </div>
+
+    <div class="card">
       <h2>Favorites <span class="sub">— full discography + new releases</span></h2>
       <div id="favlist" class="scroll"></div>
       <div class="add">
@@ -929,9 +966,39 @@ async function load(){
     const C = [['queued_flac','FLAC','ok'],['queued_alac','ALAC','ok'],
       ['queued_lossy','Lossy fallback','warn'],['exists','Already had','' ],
       ['pending','Pending',''],['no_source','No source',''],['no_meta','No metadata',''],
-      ['low_quality_only','Too low quality','warn'],['error','Errors','bad']];
+      ['low_quality_only','Too low quality','warn'],['corrupt_only','Corrupt only','bad'],
+      ['error','Errors','bad']];
     $('#counts').innerHTML = C.map(([k,lbl,cls]) => `<tr><td>${lbl}</td>
       <td style="text-align:right"><span class="pill ${(s[k]&&cls)||''}">${(s[k]??0).toLocaleString()}</span></td></tr>`).join('');
+
+    // decode gate
+    const dg = s.decode_gate || null;
+    if(dg){
+      $('#dgwarn').classList.toggle('on', !!dg.checker_warning);
+      if(dg.checker_warning){
+        $('#dgwarn').textContent = 'Warning: ' + (dg.checker_warning_reason || 'decode checker unavailable');
+      }
+      $('#dgacc').textContent = dg.accepted_24h == null ? '–' : dg.accepted_24h.toLocaleString();
+      const r24 = dg.rejects_24h ?? 0, r7 = dg.rejects_7d ?? 0;
+      $('#dgrej').innerHTML = `<span class="pill ${r24?'bad':''}">${r24.toLocaleString()}</span> / <span class="pill ${r7?'warn':''}">${r7.toLocaleString()}</span>`;
+      $('#dgmatch').textContent = `${(dg.matched_7d??0).toLocaleString()} / ${(dg.unmatched_7d??0).toLocaleString()}`;
+      const bp = dg.blocked_peers ?? 0;
+      $('#dgpeers').innerHTML = `<span class="pill ${bp?'warn':''}">${bp.toLocaleString()}</span>`;
+      const reasons = Object.entries(dg.by_reason_7d || {}).sort((a,b) => b[1] - a[1]);
+      const r24map = dg.by_reason_24h || {};
+      $('#dgreasons').innerHTML = reasons.length
+        ? '<tr><th>Reason</th><th style="text-align:right">24h / 7d</th></tr>' +
+          reasons.map(([k,v]) => `<tr><td>${esc(k)}</td>
+            <td style="text-align:right"><span class="pill ${k==='checker_unavailable'?'bad':'warn'}">${(r24map[k]||0).toLocaleString()} / ${v.toLocaleString()}</span></td></tr>`).join('')
+        : '<tr><td class="muted">No corrupt files rejected in the last 7 days.</td></tr>';
+    } else {
+      $('#dgwarn').classList.remove('on');
+      $('#dgacc').textContent = '–';
+      $('#dgrej').textContent = '–';
+      $('#dgmatch').textContent = '–';
+      $('#dgpeers').textContent = '–';
+      $('#dgreasons').innerHTML = '<tr><td class="muted">No decode gate data yet.</td></tr>';
+    }
 
     // favorites + new releases
     renderFavs(s.favorites, fav.names);

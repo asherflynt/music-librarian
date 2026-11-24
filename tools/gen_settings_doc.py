@@ -34,6 +34,8 @@ GROUPS = [
     ("Lossy → FLAC upgrades",
      ["UPGRADE_ENABLED", "UPGRADE_HOUR", "UPGRADE_MAX_PER_RUN",
       "UPGRADE_RECHECK_DAYS", "UPGRADE_ONLY_WHEN_IDLE"]),
+    ("Decode gate",
+     ["DECODE_MAX_RETRIES", "BAD_PEER_STRIKES", "BAD_PEER_DAYS"]),
 ]
 
 

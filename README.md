@@ -357,6 +357,33 @@ Makes upgrades yield to the main fill.
 
 On by default. Upgrades and normal downloads compete for the same Soulseek peers and the same bandwidth; upgrades are a nice-to-have, so they wait rather than slow down music you don't have yet.
 
+### Decode gate
+
+#### `DECODE_MAX_RETRIES`
+**Retries from other peers after a corrupt download** · default `3` · 0 – 20
+
+How many times the librarian will re-queue an album after the decode gate rejects a corrupt or truncated download.
+
+The peer that served the bad file is blocked for that album immediately, so each retry tries a different Soulseek peer. Once an album uses up this many retries, it is marked corrupt_only so it stops churning the queue.
+
+Set to 0 to never automatically retry rejected downloads.
+
+#### `BAD_PEER_STRIKES`
+**Bad albums before blocking a Soulseek peer everywhere** · default `3` · 1 – 50
+
+How many different albums a Soulseek peer can serve corrupt or truncated files for within BAD_PEER_DAYS before the librarian stops picking that peer for ANY album. Several bad tracks from the same album count once.
+
+A peer is already blocked immediately for the specific album it broke. This global threshold catches peers whose whole shared collection is damaged or re-encoded junk, without permanently banning a good peer over one bad rip.
+
+Lower it (e.g. 2) to cut off bad peers faster; raise it to be more forgiving.
+
+#### `BAD_PEER_DAYS`
+**How many days a peer's bad-file strikes stay on record** · default `90` · 1 – 3650
+
+The rolling window for counting a peer's strikes toward BAD_PEER_STRIKES.
+
+Rejections older than this many days stop counting toward a global block, so a peer who fixes their library isn't banished forever. Per-album blocks stay in place so the librarian won't re-pull the same broken copy.
+
 <!-- END SETTINGS-TABLE -->
 
 ## Play tracking
