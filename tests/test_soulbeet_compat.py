@@ -4,11 +4,16 @@
 Stdlib unittest only so tests run anywhere `librarian` can be imported.
 """
 
+import json
 import pathlib
+import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
+
+import requests
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -573,6 +578,371 @@ class TestFavoritesBypassCap(unittest.TestCase):
         self.assertIn("FAVORITES_BYPASS_CAP", web.SETTINGS)
         self.assertEqual(web.SETTINGS["FAVORITES_BYPASS_CAP"], ("bool", 0, 1))
         self.assertIn("FAVORITES_BYPASS_CAP", web.HELP)
+
+
+def _make_session_soulbeet(post_side_effect=None, post_return_value=None):
+    """Build a Soulbeet instance backed by a mocked requests.Session (real _post)."""
+    sb = object.__new__(librarian.Soulbeet)
+    sb.user = "test"
+    sb.pw = "test"
+    sb.auth_lock = threading.Lock()
+    sb.s = mock.MagicMock()
+    if post_side_effect is not None:
+        sb.s.post.side_effect = post_side_effect
+    elif post_return_value is not None:
+        sb.s.post.return_value = post_return_value
+    sb.login = mock.Mock()
+    return sb
+
+
+def _mock_response(status_code, json_data=None, text=None):
+    r = mock.Mock()
+    r.status_code = status_code
+    if json_data is not None:
+        r.json.return_value = json_data
+        r.text = json.dumps(json_data) if text is None else text
+    else:
+        r.json.side_effect = ValueError("not json")
+        r.text = "" if text is None else text
+    return r
+
+
+class TestSoulbeetTransientErrors(unittest.TestCase):
+    def test_post_409_backend_unreachable_raises_backend_unavailable(self):
+        body = {
+            "message": "error running server function: Request error: error sending request",
+            "code": 409,
+            "data": {
+                "ServerError": {
+                    "message": "Request error: error sending request",
+                    "code": 409,
+                    "details": {
+                        "cause": {"raw": "connection refused", "service": "slskd", "status": None},
+                        "code": "backend_unreachable",
+                        "retry": "same_source_later",
+                        "stage": "source_search",
+                    },
+                }
+            },
+        }
+        sb = _make_session_soulbeet(post_return_value=_mock_response(409, json_data=body))
+        with self.assertRaises(librarian.BackendUnavailable) as ctx:
+            sb._post("/api/download/search/poll", {"input": {"search_id": "x"}})
+        self.assertIn("409", str(ctx.exception))
+        self.assertIn("backend_unreachable", str(ctx.exception))
+
+    def test_post_retry_hint_alone_is_not_an_outage(self):
+        # A per-peer failure can carry retry=same_source_later; it must become a
+        # normal error, not an outage that keeps the candidate pending forever.
+        for retry_val in ("same_source_later", "later"):
+            with self.subTest(retry=retry_val):
+                body = {"data": {"ServerError": {"details": {"retry": retry_val,
+                                                             "code": "source_offline"}}}}
+                sb = _make_session_soulbeet(post_return_value=_mock_response(409, json_data=body))
+                with self.assertRaises(requests.HTTPError) as ctx:
+                    sb._post("/api/download/search/start", {})
+                self.assertNotIsInstance(ctx.exception, librarian.BackendUnavailable)
+
+    def test_post_502_503_504_raise_backend_unavailable(self):
+        for code in (502, 503, 504):
+            with self.subTest(code=code):
+                sb = _make_session_soulbeet(
+                    post_return_value=_mock_response(code, text="Service Unavailable")
+                )
+                with self.assertRaises(librarian.BackendUnavailable):
+                    sb._post("/api/metadata/search/album", {})
+
+    def test_post_circuit_breaker_text_raises_backend_unavailable(self):
+        cases = [
+            _mock_response(
+                503,
+                text="API error: 503 - Circuit breaker is open - slskd appears to be unavailable",
+            ),
+            _mock_response(
+                409,
+                json_data={
+                    "data": {
+                        "ServerError": {
+                            "message": "API error: 503 - Circuit breaker is open - slskd appears to be unavailable"
+                        }
+                    }
+                },
+            ),
+            _mock_response(
+                500,
+                text="API error: 503 - Circuit breaker is open - slskd appears to be unavailable",
+            ),
+        ]
+        for resp in cases:
+            with self.subTest(code=resp.status_code):
+                sb = _make_session_soulbeet(post_return_value=resp)
+                with self.assertRaises(librarian.BackendUnavailable):
+                    sb._post("/api/download/search/start", {})
+
+    def test_post_connection_error_and_timeout_raise_backend_unavailable(self):
+        for exc in (requests.ConnectionError("refused"), requests.Timeout("timed out")):
+            with self.subTest(exc=type(exc).__name__):
+                sb = _make_session_soulbeet(post_side_effect=exc)
+                with self.assertRaises(librarian.BackendUnavailable):
+                    sb._post("/api/metadata/search/album", {})
+
+    def test_post_plain_500_is_not_transient_and_truncates_body(self):
+        long_body = "fatal database syntax error: " + ("x" * 500)
+        sb = _make_session_soulbeet(post_return_value=_mock_response(500, text=long_body))
+        with self.assertRaises(requests.HTTPError) as ctx:
+            sb._post("/api/metadata/search/album", {})
+        self.assertNotIsInstance(ctx.exception, librarian.BackendUnavailable)
+        msg = str(ctx.exception)
+        self.assertIn("500", msg)
+        self.assertIn("fatal database syntax error", msg)
+        # Body portion is truncated to <= 300 chars
+        body_part = msg.split(": ", 1)[1]
+        self.assertLessEqual(len(body_part), 300)
+
+    def test_post_malformed_details_shape_is_not_transient_and_does_not_crash(self):
+        for payload in (
+            {"data": None},
+            {"data": "oops"},
+            {"data": {"ServerError": None}},
+            {"data": {"ServerError": {"details": "not-a-dict"}}},
+            {"data": {"ServerError": {"details": {"code": "invalid_input", "retry": ["bad"]}}}},
+            ["unexpected", "list"],
+        ):
+            with self.subTest(payload=payload):
+                sb = _make_session_soulbeet(post_return_value=_mock_response(400, json_data=payload))
+                with self.assertRaises(requests.HTTPError) as ctx:
+                    sb._post("/api/metadata/search/album", {})
+                self.assertNotIsInstance(ctx.exception, librarian.BackendUnavailable)
+
+    def test_post_401_reauthenticates_and_retries(self):
+        ok_resp = _mock_response(200, json_data=[{"kind": "Album"}])
+        unauth_resp = _mock_response(401, text="expired")
+        sb = _make_session_soulbeet(post_side_effect=[unauth_resp, ok_resp])
+        res = sb._post("/api/metadata/search/album", {})
+        self.assertEqual(res, [{"kind": "Album"}])
+        sb.login.assert_called_once()
+        self.assertEqual(sb.s.post.call_count, 2)
+
+
+class TestCandidateTransientAndErrorRetry(unittest.TestCase):
+    def _with_temp_state(self):
+        tmp = tempfile.TemporaryDirectory()
+        tmp_path = pathlib.Path(tmp.name)
+        patches = [
+            mock.patch.object(librarian, "DATA_DIR", tmp_path),
+            mock.patch.object(librarian, "STATE_DB", tmp_path / "state.db"),
+        ]
+        for p in patches:
+            p.start()
+        st = librarian.State()
+
+        def cleanup():
+            st.conn.close()
+            for p in reversed(patches):
+                p.stop()
+            tmp.cleanup()
+
+        self.addCleanup(cleanup)
+        return st
+
+    def test_process_candidate_leaves_pending_on_backend_unavailable(self):
+        st = self._with_temp_state()
+        st.add_candidate("Devault", "Sensation", "album", priority=50)
+        row = st.pending_candidates(limit=1)[0]
+
+        sb = mock.MagicMock()
+        sb.search_album.side_effect = librarian.BackendUnavailable("slskd down")
+        secrets = {"SOULBEET_USER": "u", "SOULBEET_PASS": "p"}
+        down_ev = threading.Event()
+
+        with mock.patch.object(librarian, "navidrome_album_exists", return_value=False):
+            res = librarian.process_candidate(st, sb, secrets, row, backend_down=down_ev)
+
+        self.assertEqual(res, "backend_down")
+        self.assertTrue(down_ev.is_set())
+        status, attempts, priority = st.conn.execute(
+            "SELECT status, attempts, priority FROM candidates WHERE key=?", (row[0],)
+        ).fetchone()
+        self.assertEqual(status, "pending")
+        self.assertEqual(attempts, 0)
+        self.assertEqual(priority, 50)
+
+        # Subsequent candidate with event already set short-circuits without calling Soulbeet
+        sb.reset_mock()
+        with mock.patch.object(librarian, "navidrome_album_exists", return_value=False) as nav_m:
+            res2 = librarian.process_candidate(st, sb, secrets, row, backend_down=down_ev)
+        self.assertEqual(res2, "backend_down")
+        sb.search_album.assert_not_called()
+        nav_m.assert_not_called()
+
+    def test_process_candidate_sets_error_and_increments_attempts_on_other_errors(self):
+        st = self._with_temp_state()
+        st.add_candidate("Devault", "Sensation", "album")
+        row = st.pending_candidates(limit=1)[0]
+
+        sb = mock.MagicMock()
+        sb.search_album.side_effect = requests.HTTPError("Soulbeet HTTP 500: boom")
+        secrets = {"SOULBEET_USER": "u", "SOULBEET_PASS": "p"}
+
+        with mock.patch.object(librarian, "navidrome_album_exists", return_value=False):
+            res1 = librarian.process_candidate(st, sb, secrets, row)
+            self.assertEqual(res1, "error")
+            status, attempts = st.conn.execute(
+                "SELECT status, attempts FROM candidates WHERE key=?", (row[0],)
+            ).fetchone()
+            self.assertEqual((status, attempts), ("error", 1))
+
+            # Second error increments attempts again
+            res2 = librarian.process_candidate(st, sb, secrets, row)
+            self.assertEqual(res2, "error")
+            status, attempts = st.conn.execute(
+                "SELECT status, attempts FROM candidates WHERE key=?", (row[0],)
+            ).fetchone()
+            self.assertEqual((status, attempts), ("error", 2))
+
+    def test_upgrade_one_leaves_row_retryable_on_backend_unavailable(self):
+        st = self._with_temp_state()
+        st.put_files([
+            ("/music/Devault/Sensation/01.mp3", "/music/Devault/Sensation",
+             "Devault", "Sensation", "mp3", 0, 320, 1000, 100, 100),
+        ])
+        cand = st.lossy_albums(limit=5, older_than=0)[0]
+
+        sb = mock.MagicMock()
+        sb.search_album.side_effect = librarian.BackendUnavailable("503 circuit open")
+
+        res = librarian.upgrade_one(st, sb, cand, {})
+        self.assertEqual(res, "backend_down")
+        # Row was not marked failed and not given a recent last_checked
+        row = st.conn.execute("SELECT status, attempts, last_checked FROM upgrades WHERE key=?",
+                              (cand["key"],)).fetchone()
+        self.assertIsNone(row)
+        # Remains immediately eligible on the next pass
+        still_due = st.lossy_albums(limit=5, older_than=0)
+        self.assertEqual([c["key"] for c in still_due], [cand["key"]])
+
+    def test_requeue_errors_respects_cutoff_max_attempts_priority_and_disabled(self):
+        st = self._with_temp_state()
+        now = 1_700_000_000
+        old_ts = now - 10 * 86400
+        recent_ts = now - 2 * 86400
+        cutoff = now - 7 * 86400
+
+        # Seed candidates with various statuses, ages, attempts, and priorities
+        rows = [
+            # Eligible: old error, historical attempts=0, favorite priority=100
+            ("a1|alb1|album", "A1", "Alb1", "album", "error", old_ts, 100, 0),
+            # Eligible: old error, historical attempts=NULL, normal priority=0
+            ("a2|alb2|album", "A2", "Alb2", "album", "error", old_ts, 0, None),
+            # Eligible: old error, attempts=2 (< 3), priority=50
+            ("a3|alb3|album", "A3", "Alb3", "album", "error", old_ts, 50, 2),
+            # Ineligible: old error, attempts=3 (>= 3)
+            ("a4|alb4|album", "A4", "Alb4", "album", "error", old_ts, 100, 3),
+            # Ineligible: recent error, attempts=1
+            ("a5|alb5|album", "A5", "Alb5", "album", "error", recent_ts, 0, 1),
+            # Ineligible: old non-error status
+            ("a6|alb6|album", "A6", "Alb6", "album", "no_source", old_ts, 0, 0),
+        ]
+        st.conn.executemany(
+            "INSERT INTO candidates(key, artist, album, kind, status, updated_at, priority, attempts) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        st.conn.commit()
+
+        # ERROR_RETRY_DAYS=0 must not resurrect anything
+        res_disabled = librarian.maybe_requeue_errors(
+            st, {"ERROR_RETRY_DAYS": 0, "ERROR_MAX_ATTEMPTS": 3}, now=now
+        )
+        self.assertEqual(res_disabled, 0)
+        self.assertEqual(st.status_counts().get("pending", 0), 0)
+
+        # Direct requeue_errors flips only the 3 eligible rows and preserves priority
+        count = st.requeue_errors(cutoff, max_attempts=3)
+        self.assertEqual(count, 3)
+
+        got = {
+            r[0]: (r[1], r[2])
+            for r in st.conn.execute("SELECT key, status, priority FROM candidates").fetchall()
+        }
+        self.assertEqual(got["a1|alb1|album"], ("pending", 100))
+        self.assertEqual(got["a2|alb2|album"], ("pending", 0))
+        self.assertEqual(got["a3|alb3|album"], ("pending", 50))
+        self.assertEqual(got["a4|alb4|album"], ("error", 100))
+        self.assertEqual(got["a5|alb5|album"], ("error", 0))
+        self.assertEqual(got["a6|alb6|album"], ("no_source", 0))
+
+    def test_maybe_requeue_errors_respects_6h_interval(self):
+        st = self._with_temp_state()
+        t0 = 1_700_000_000
+        old_ts = t0 - 10 * 86400
+        cfg = {"ERROR_RETRY_DAYS": 7, "ERROR_MAX_ATTEMPTS": 3}
+
+        st.conn.execute(
+            "INSERT INTO candidates(key, artist, album, kind, status, updated_at, priority, attempts) "
+            "VALUES('k1','A','B','album','error',?,0,1)",
+            (old_ts,),
+        )
+        st.conn.commit()
+
+        self.assertEqual(librarian.maybe_requeue_errors(st, cfg, now=t0), 1)
+        self.assertEqual(int(st.get_meta("last_error_requeue")), t0)
+
+        # Add another old error: within 6h cooldown it must not run yet
+        st.conn.execute(
+            "INSERT INTO candidates(key, artist, album, kind, status, updated_at, priority, attempts) "
+            "VALUES('k2','A','C','album','error',?,0,1)",
+            (old_ts,),
+        )
+        st.conn.commit()
+        self.assertEqual(librarian.maybe_requeue_errors(st, cfg, now=t0 + 3600), 0)
+
+        # After 6 hours it runs again
+        self.assertEqual(librarian.maybe_requeue_errors(st, cfg, now=t0 + 6 * 3600), 1)
+
+    def test_migrate_adds_attempts_column_to_legacy_db(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE candidates ("
+                "key TEXT PRIMARY KEY, artist TEXT, album TEXT, kind TEXT, "
+                "status TEXT DEFAULT 'pending', updated_at INTEGER DEFAULT 0)"
+            )
+            librarian._migrate(conn)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(candidates)")}
+            self.assertIn("attempts", cols)
+            self.assertIn("priority", cols)
+        finally:
+            conn.close()
+
+    def test_error_retry_config_and_web_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = pathlib.Path(tmp) / "config.env"
+            with mock.patch.object(librarian, "CONFIG_ENV", cfg_path):
+                defaults = librarian.load_config()
+                self.assertEqual(defaults["ERROR_RETRY_DAYS"], 7)
+                self.assertEqual(defaults["ERROR_MAX_ATTEMPTS"], 3)
+                cfg_path.write_text("ERROR_RETRY_DAYS=0\nERROR_MAX_ATTEMPTS=5\n")
+                loaded = librarian.load_config()
+                self.assertEqual(loaded["ERROR_RETRY_DAYS"], 0)
+                self.assertEqual(loaded["ERROR_MAX_ATTEMPTS"], 5)
+
+        self.assertEqual(web.SETTINGS["ERROR_RETRY_DAYS"], ("int", 0, 365))
+        self.assertEqual(web.SETTINGS["ERROR_MAX_ATTEMPTS"], ("int", 1, 20))
+        self.assertIn("ERROR_RETRY_DAYS", web.HELP)
+        self.assertIn("ERROR_MAX_ATTEMPTS", web.HELP)
+
+
+class TestBackendBackoff(unittest.TestCase):
+    def test_backoff_schedule_doubles_and_caps_at_15_min(self):
+        self.assertEqual(librarian.backend_backoff_seconds(0), 0)
+        self.assertEqual(librarian.backend_backoff_seconds(-2), 0)
+        self.assertEqual(librarian.backend_backoff_seconds(1), 120)
+        self.assertEqual(librarian.backend_backoff_seconds(2), 240)
+        self.assertEqual(librarian.backend_backoff_seconds(3), 480)
+        self.assertEqual(librarian.backend_backoff_seconds(4), 900)
+        self.assertEqual(librarian.backend_backoff_seconds(5), 900)
+        self.assertEqual(librarian.backend_backoff_seconds(100), 900)
 
 
 if __name__ == "__main__":

@@ -180,6 +180,8 @@ def load_config():
         "TASTE_REFRESH_MIN": num("TASTE_REFRESH_MIN", 360, int),   # re-pull play counts every 6h
         "MEASURE_EVERY_SEC": num("MEASURE_EVERY_SEC", 300, int),
         "SCAN_MAX_PROBES_PER_PASS": max(1, num("SCAN_MAX_PROBES_PER_PASS", 250, int)),
+        "ERROR_RETRY_DAYS": max(0, num("ERROR_RETRY_DAYS", 7, int)),
+        "ERROR_MAX_ATTEMPTS": max(1, num("ERROR_MAX_ATTEMPTS", 3, int)),
         "PAUSED": flag("PAUSED"),
         # taste weighting
         "TASTE_HALF_LIFE_DAYS": max(1.0, num("TASTE_HALF_LIFE_DAYS", 365, float)),
@@ -310,6 +312,8 @@ def _migrate(conn):
         # queue behind however many thousand candidates the 100k-track fill has
         # already generated.
         ("candidates", "priority", "INTEGER DEFAULT 0"),
+        # Cap how many times an errored candidate is automatically retried.
+        ("candidates", "attempts", "INTEGER DEFAULT 0"),
     ):
         if name not in cols(table):
             log(f"Migrating state.db: adding {table}.{name}")
@@ -408,10 +412,35 @@ class State:
 
     def set_status(self, key, status, fmt=None, kbps=None):
         with self.lock:
-            self.conn.execute(
-                "UPDATE candidates SET status=?, fmt=?, kbps=?, updated_at=? WHERE key=?",
-                (status, fmt, kbps, int(time.time()), key))
+            if status == "error":
+                self.conn.execute(
+                    "UPDATE candidates SET status=?, fmt=?, kbps=?, updated_at=?, "
+                    "attempts=COALESCE(attempts, 0) + 1 WHERE key=?",
+                    (status, fmt, kbps, int(time.time()), key))
+            else:
+                self.conn.execute(
+                    "UPDATE candidates SET status=?, fmt=?, kbps=?, updated_at=? WHERE key=?",
+                    (status, fmt, kbps, int(time.time()), key))
             self.conn.commit()
+
+    def requeue_errors(self, older_than_ts, max_attempts):
+        """Flip old 'error' candidates back to 'pending' while under max_attempts.
+
+        Historical error rows (attempts 0 or NULL) are eligible. Priority is
+        left untouched.
+        """
+        if not max_attempts or max_attempts <= 0:
+            return 0
+        now = int(time.time())
+        with self.lock:
+            cur = self.conn.execute(
+                "UPDATE candidates SET status='pending', updated_at=? "
+                "WHERE status='error' AND COALESCE(updated_at, 0) < ? "
+                "AND COALESCE(attempts, 0) < ?",
+                (now, int(older_than_ts), int(max_attempts)),
+            )
+            self.conn.commit()
+            return cur.rowcount
 
     def fallbacks(self, limit=25):
         """Recent non-FLAC acquisitions, so it's always visible what fell back."""
@@ -584,6 +613,56 @@ class State:
 # ----------------------------------------------------------------------------
 # Soulbeet client (auth + FLAC/lossy pipeline)
 # ----------------------------------------------------------------------------
+class BackendUnavailable(RuntimeError):
+    """Raised when Soulbeet or its upstream backend (slskd) is transiently down."""
+
+
+_TRANSIENT_HTTP_CODES = frozenset({502, 503, 504})
+
+
+def _truncate_body(text, limit=300):
+    s = " ".join((text or "").split())
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1] + "…"
+
+
+def _iter_error_details(payload):
+    """Yield every dict stored under a 'details' key anywhere in a JSON payload."""
+    stack = [payload]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            det = cur.get("details")
+            if isinstance(det, dict):
+                yield det
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+
+
+def _transient_backend_reason(status_code, body_text, payload):
+    """Return a short reason string if a 4xx/5xx response signals a transient backend
+    outage, else None."""
+    if payload is not None:
+        for det in _iter_error_details(payload):
+            # Only a whole-backend outage counts. A bare retry hint such as
+            # "same_source_later" can describe one offline peer; treating that as
+            # an outage would leave the candidate pending at the head of the queue
+            # and back off forever.
+            if det.get("code") == "backend_unreachable":
+                return "backend_unreachable"
+    if "circuit breaker is open" in (body_text or "").lower():
+        return "circuit breaker open"
+    if status_code in _TRANSIENT_HTTP_CODES:
+        return f"HTTP {status_code}"
+    return None
+
+
 class Soulbeet:
     def __init__(self, secrets):
         self.user = secrets["SOULBEET_USER"]
@@ -600,12 +679,42 @@ class Soulbeet:
             log("Soulbeet: authenticated")
 
     def _post(self, path, body, timeout=60, _retry=True):
-        r = self.s.post(f"{SOULBEET_URL}{path}", json=body, timeout=timeout)
+        try:
+            r = self.s.post(f"{SOULBEET_URL}{path}", json=body, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise BackendUnavailable(f"Soulbeet {path} unreachable: {e}") from e
         if r.status_code in (401, 403) and _retry:
             log("Soulbeet: session expired, re-authenticating")
-            self.login()
+            try:
+                self.login()
+            except (requests.ConnectionError, requests.Timeout) as e:
+                raise BackendUnavailable(f"Soulbeet login unreachable: {e}") from e
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code in _TRANSIENT_HTTP_CODES:
+                    raise BackendUnavailable(f"Soulbeet login HTTP {e.response.status_code}") from e
+                raise
             return self._post(path, body, timeout, _retry=False)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raw_text = getattr(r, "text", "")
+            body_text = raw_text if isinstance(raw_text, str) else ""
+            payload = None
+            try:
+                payload = r.json()
+            except Exception:
+                payload = None
+            if not body_text and payload is not None:
+                try:
+                    body_text = json.dumps(payload)
+                except Exception:
+                    body_text = str(payload)
+            snippet = _truncate_body(body_text, 300)
+            reason = _transient_backend_reason(r.status_code, body_text, payload)
+            if reason:
+                tag = f" ({reason})" if reason != f"HTTP {r.status_code}" else ""
+                msg = f"Soulbeet HTTP {r.status_code} on {path}{tag}" + (f": {snippet}" if snippet else "")
+                raise BackendUnavailable(msg)
+            msg = f"Soulbeet HTTP {r.status_code} on {path}" + (f": {snippet}" if snippet else "")
+            raise requests.HTTPError(msg, response=r)
         return r.json()
 
     @staticmethod
@@ -1593,13 +1702,18 @@ def expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set):
     return new
 
 
-def process_candidate(state, sb, secrets, row):
+def process_candidate(state, sb, secrets, row, backend_down=None):
     key, artist, album, kind = row
+    if backend_down is not None and backend_down.is_set():
+        return "backend_down"
     try:
         # skip if already in the Navidrome library
         if album and navidrome_album_exists(secrets["SOULBEET_USER"], secrets["SOULBEET_PASS"], artist, album):
             state.set_status(key, "exists")
             return "exists"
+
+        if backend_down is not None and backend_down.is_set():
+            return "backend_down"
 
         album_obj, tracks = None, []
         results = sb.search_album(artist, album or artist)
@@ -1631,6 +1745,12 @@ def process_candidate(state, sb, secrets, row):
         state.set_status(key, status,
                          fmt=(info or {}).get("fmt"), kbps=(info or {}).get("kbps"))
         return status
+    except BackendUnavailable as e:
+        if backend_down is None or not backend_down.is_set():
+            if backend_down is not None:
+                backend_down.set()
+            log(f"  backend unavailable [{artist} - {album}] (leaving pending): {e}")
+        return "backend_down"
     except Exception as e:
         log(f"  candidate error [{artist} - {album}]: {e}")
         state.set_status(key, "error")
@@ -1648,32 +1768,39 @@ def upgrade_one(state, sb, cand, cfg):
     mutagen classified as lossy in the first place.
     """
     key, artist, album = cand["key"], cand["artist"], cand["album"]
-    state.upsert_upgrade(key, artist=artist, album=album, dir=cand["dir"],
-                         cur_codec=cand["codec"], cur_kbps=cand["kbps"],
-                         cur_tracks=cand["tracks"], last_checked=int(time.time()),
-                         attempts=(cand.get("attempts", 0) + 1))
+
+    def record(status, note):
+        state.upsert_upgrade(
+            key, artist=artist, album=album, dir=cand["dir"],
+            cur_codec=cand["codec"], cur_kbps=cand["kbps"],
+            cur_tracks=cand["tracks"], last_checked=int(time.time()),
+            attempts=(cand.get("attempts", 0) + 1),
+            status=status, note=note,
+        )
+
     try:
         results = sb.search_album(artist, album)
         if not results:
-            state.upsert_upgrade(key, status="no_flac", note="no album metadata match")
+            record("no_flac", "no album metadata match")
             return "no_flac"
         sid = sb.start_search(results[0], [])
         res = sb.poll(sid)
         status, items, info = pick_by_quality_ladder(res.get("groups", []))
         if status != "queued_flac" or not items:
-            state.upsert_upgrade(key, status="no_flac",
-                                 note=f"best available was {status}")
+            record("no_flac", f"best available was {status}")
             return "no_flac"
         # Stage it, never straight into the library: nothing replaces a file you
         # already have until the swap script has verified it end to end.
         sb.queue(items, sid, target_folder=UPGRADE_FOLDER)
-        state.upsert_upgrade(key, status="queued",
-                             note=f"flac @ ~{(info or {}).get('kbps', 0)} kbps staged")
+        record("queued", f"flac @ ~{(info or {}).get('kbps', 0)} kbps staged")
         log(f"  UPGRADE [{artist} - {album}]: {cand['codec']} @ ~{cand['kbps']} kbps "
             f"-> FLAC staged for verification")
         return "queued"
+    except BackendUnavailable as e:
+        log(f"  upgrade deferred [{artist} - {album}] (backend unavailable): {e}")
+        return "backend_down"
     except Exception as e:
-        state.upsert_upgrade(key, status="failed", note=str(e)[:200])
+        record("failed", str(e)[:200])
         log(f"  upgrade error [{artist} - {album}]: {e}")
         return "failed"
 
@@ -1688,7 +1815,11 @@ def upgrade_pass(state, sb, cfg):
         f"(max {cfg['UPGRADE_MAX_PER_RUN']}/run)")
     counts = collections.Counter()
     for c in cands:
-        counts[upgrade_one(state, sb, c, cfg)] += 1
+        res = upgrade_one(state, sb, c, cfg)
+        counts[res] += 1
+        if res == "backend_down":
+            log("Upgrade pass: backend unavailable; stopping pass early")
+            break
     log(f"Upgrade pass done: {dict(counts)}")
 
 
@@ -1847,6 +1978,42 @@ def should_bypass_cap_for_favorites(reason, cfg):
     )
 
 
+BACKEND_BACKOFF_INITIAL_SEC = 120
+BACKEND_BACKOFF_MAX_SEC = 900  # 15 min
+ERROR_RETRY_CHECK_INTERVAL_SEC = 6 * 3600
+
+
+def backend_backoff_seconds(consecutive_failures,
+                            initial=BACKEND_BACKOFF_INITIAL_SEC,
+                            maximum=BACKEND_BACKOFF_MAX_SEC):
+    """Exponential backoff delay (seconds) across consecutive backend-down waves."""
+    if consecutive_failures <= 0:
+        return 0
+    return min(maximum, initial * (2 ** min(consecutive_failures - 1, 30)))
+
+
+def maybe_requeue_errors(state, cfg, now=None):
+    """Periodically flip old errored candidates back to pending.
+
+    Runs at most once every 6 hours (tracked in meta['last_error_requeue']).
+    Disabled when ERROR_RETRY_DAYS == 0.
+    """
+    retry_days = int(cfg.get("ERROR_RETRY_DAYS", 7) or 0)
+    if retry_days <= 0:
+        return 0
+    now = int(time.time() if now is None else now)
+    raw_last = state.get_meta("last_error_requeue")
+    if raw_last is not None and now - int(raw_last) < ERROR_RETRY_CHECK_INTERVAL_SEC:
+        return 0
+    max_attempts = int(cfg.get("ERROR_MAX_ATTEMPTS", 3) or 0)
+    cutoff = now - retry_days * 86400
+    count = state.requeue_errors(cutoff, max_attempts)
+    state.set_meta("last_error_requeue", now)
+    log(f"Error retry: requeued {count} errored candidate(s) "
+        f"(older than {retry_days}d, max_attempts={max_attempts})")
+    return count
+
+
 def main():
     log("Librarian starting")
     secrets = load_secrets()
@@ -1861,6 +2028,8 @@ def main():
             "(optional; Navidrome + YouTube Music still work)")
 
     busy = threading.Event()
+    backend_down = threading.Event()
+    down_waves = 0
     web.serve(WEB_PORT, {
         "state": state, "cfg": load_config, "log_ring": LOG_RING,
         "status_json": STATUS_JSON, "config_env": CONFIG_ENV,
@@ -1929,6 +2098,9 @@ def main():
                 time.time() - last_fav > cfg["FAVORITE_SYNC_HOURS"] * 3600:
             favorites_sync(state, secrets, mb, cfg, exclude_set)
 
+        # periodically re-queue old errored candidates (respects priority)
+        maybe_requeue_errors(state, cfg)
+
         if not favorites_only:
             # expand a few top-weighted artists into album candidates
             for artist, weight in state.unexpanded_artists(limit=5):
@@ -1957,12 +2129,26 @@ def main():
                 time.sleep(10)
                 continue
 
+        backend_down.clear()
         busy.set()      # tells the upgrade loop to stay out of the way
         try:
             with ThreadPoolExecutor(max_workers=cfg["CONCURRENCY"]) as ex:
-                list(ex.map(lambda r: process_candidate(state, sb, secrets, r), batch))
+                results = list(ex.map(
+                    lambda r: process_candidate(state, sb, secrets, r,
+                                                backend_down=backend_down),
+                    batch,
+                ))
         finally:
             busy.clear()
+
+        if "backend_down" in results:
+            down_waves += 1
+            delay = backend_backoff_seconds(down_waves)
+            log(f"Soulbeet backend unavailable (wave {down_waves}); "
+                f"backing off {delay}s before retrying")
+            time.sleep(delay)
+            continue
+        down_waves = 0
 
         time.sleep(1)
 

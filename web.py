@@ -34,6 +34,8 @@ SETTINGS = {
     "TASTE_REFRESH_MIN":        ("int", 5, 100_000),
     "MEASURE_EVERY_SEC":        ("int", 30, 86_400),
     "SCAN_MAX_PROBES_PER_PASS": ("int", 10, 100_000),
+    "ERROR_RETRY_DAYS":         ("int", 0, 365),
+    "ERROR_MAX_ATTEMPTS":       ("int", 1, 20),
     "PAUSED":                   ("bool", 0, 1),
     "TASTE_HALF_LIFE_DAYS":     ("float", 1.0, 36_500.0),
     "WEIGHT_NAVIDROME":         ("float", 0.0, 100.0),
@@ -134,6 +136,24 @@ HELP = {
         "Files that don't fit in a pass simply wait for the next one, so the scan "
         "still finishes — it just spreads the load. At the default it works through "
         "roughly 3,000 files an hour. Only raise it if you know the server is idle."),
+    "ERROR_RETRY_DAYS": (
+        "Retry errored albums after this many days (0 = never)",
+        "How long to wait before giving a failed download candidate another try.\n\n"
+        "Transient Soulbeet or slskd outages don't mark albums as errors at all — the "
+        "librarian simply backs off and keeps them pending. When an album does hit a "
+        "real error, it sits out for this many days before being re-queued automatically "
+        "(checked every 6 hours, without changing its priority), up to "
+        "ERROR_MAX_ATTEMPTS total tries.\n\n"
+        "Set to 0 to disable automatic error retries and leave errored albums alone."),
+    "ERROR_MAX_ATTEMPTS": (
+        "Maximum failed tries before giving up on an album",
+        "How many times a candidate can error out before the librarian stops "
+        "re-queuing it.\n\n"
+        "Prevents broken metadata or permanently unfetchable albums from cycling "
+        "through the queue forever. Once an album hits this many errors, "
+        "ERROR_RETRY_DAYS will leave it alone.\n\n"
+        "Historical errors recorded before attempt counting was added start at 0, so "
+        "they get a clean set of retries."),
     "PAUSED": (
         "Stop queueing downloads, keep everything else running",
         "Pauses new downloads without stopping the container or losing any progress.\n\n"

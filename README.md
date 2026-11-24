@@ -188,6 +188,24 @@ This is a safety limit rather than a speed dial. Your library is reached through
 
 Files that don't fit in a pass simply wait for the next one, so the scan still finishes — it just spreads the load. At the default it works through roughly 3,000 files an hour. Only raise it if you know the server is idle.
 
+#### `ERROR_RETRY_DAYS`
+**Retry errored albums after this many days (0 = never)** · default `7` · 0 – 365
+
+How long to wait before giving a failed download candidate another try.
+
+Transient Soulbeet or slskd outages don't mark albums as errors at all — the librarian simply backs off and keeps them pending. When an album does hit a real error, it sits out for this many days before being re-queued automatically (checked every 6 hours, without changing its priority), up to ERROR_MAX_ATTEMPTS total tries.
+
+Set to 0 to disable automatic error retries and leave errored albums alone.
+
+#### `ERROR_MAX_ATTEMPTS`
+**Maximum failed tries before giving up on an album** · default `3` · 1 – 20
+
+How many times a candidate can error out before the librarian stops re-queuing it.
+
+Prevents broken metadata or permanently unfetchable albums from cycling through the queue forever. Once an album hits this many errors, ERROR_RETRY_DAYS will leave it alone.
+
+Historical errors recorded before attempt counting was added start at 0, so they get a clean set of retries.
+
 #### `PAUSED`
 **Stop queueing downloads, keep everything else running** · default `off` · on / off
 
