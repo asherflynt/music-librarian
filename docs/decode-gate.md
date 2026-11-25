@@ -50,21 +50,35 @@ slskd download -> /downloads (staging) -> beets import (Soulbeet)
      2026-11-24: decoded 11 µs without the map, 302 s with it.
    - A file with no audio stream at all is a `decode_error`.
    - Any stderr output, or a non-zero exit code, is a `decode_error` — **except**
-     stderr lines emitted by explicit non-audio (image/video) decoder contexts
-     such as `[mjpeg @ 0x...]`, `[png @ 0x...]`, `[bmp @ 0x...]`, `[gif @ 0x...]`,
-     `[webp @ 0x...]`, `[tiff @ 0x...]`, `[jpeg2000 @ 0x...]`, `[mjpegb @ 0x...]`,
-     and `[jpegls @ 0x...]` (the full explicit allowlist lives in
-     `IGNORED_NON_AUDIO_CODECS` in `decodecheck.py`). Even with `-vn`, ffmpeg
-     still probes embedded cover art (`attached_pic` streams) during input open
-     and can log e.g. `[mjpeg @ 0x...] unable to decode APP fields: Invalid data
-     found when processing input` on damaged cover art while the audio decodes
-     cleanly (verified 2026-11-25 on live rejects: 44 FLACs across 3 albums had
-     `decoded_s == header_s` with only `[mjpeg @ ...]` stderr). Ignored
-     non-audio warnings are recorded in the accepted `checked.jsonl` line
-     (`ignored_image_warnings` / `ignored_image_warning_details`) and never
-     reject; audio decoder errors (`[flac @ ...]`, `[mp3float @ ...]`,
-     `[aac @ ...]`, etc.), unprefixed stderr lines, and any non-zero exit code
-     still reject as `decode_error`.
+     two explicit, conservative allowlists in `decodecheck.py`:
+     1. **Non-audio (image/video) decoder contexts** (`IGNORED_NON_AUDIO_CODECS`),
+        such as `[mjpeg @ 0x...]`, `[png @ 0x...]`, `[bmp @ 0x...]`,
+        `[gif @ 0x...]`, `[webp @ 0x...]`, `[tiff @ 0x...]`, `[jpeg2000 @ 0x...]`,
+        `[mjpegb @ 0x...]`, and `[jpegls @ 0x...]`. Even with `-vn`, ffmpeg still
+        probes embedded cover art (`attached_pic` streams) during input open and
+        can log e.g. `[mjpeg @ 0x...] unable to decode APP fields: Invalid data
+        found when processing input` on damaged cover art while the audio decodes
+        cleanly (verified 2026-11-25 on live rejects: 44 FLACs across 3 albums
+        had `decoded_s == header_s` with only `[mjpeg @ ...]` stderr).
+     2. **Metadata / tag-parsing warnings** (`IGNORED_METADATA_WARNINGS` and
+        `IGNORED_METADATA_WARNING_PATTERNS`), matched on the exact full line
+        (optionally after a single `[<ctx> @ 0x...]` prefix such as
+        `[mp3 @ 0x...]`, `[flac @ 0x...]`, `[id3v2 @ 0x...]`, or
+        `[mov,mp4,m4a,3gp,3g2,mj2 @ 0x...]`). These cover strictly tag-only
+        messages verified in FFmpeg 8.0 `libavformat/` (`id3v2.c`, `apetag.c`,
+        `flac_picture.c`, `flacdec.c`, `oggparsevorbis.c`, `mov.c`), such as
+        unprefixed `Incorrect BOM value` / `Error reading lyrics, skipped` from
+        malformed ID3v2 USLT/COMM text frames (verified 2026-11-25 on live
+        rejects: 3 MP3s in *Conversational Lush* had `decoded_s == header_s`
+        with only those two lines). `Last message repeated N times` is also
+        ignored only when the immediately preceding stderr line was ignored.
+     Ignored warnings are recorded in the accepted `checked.jsonl` line
+     (`ignored_image_warnings` / `ignored_image_warning_details` and
+     `ignored_metadata_warnings` / `ignored_metadata_warning_details`) and never
+     reject on their own. Generic errors (`Invalid data found when processing
+     input`, `Header missing`, `Error while decoding stream`, audio decoder
+     errors like `[flac @ ...]` / `[mp3float @ ...]` / `[aac @ ...]`), any
+     non-zero exit code, truncation, and lossless `no_duration` still reject.
    - The last `out_time_us` gives the decoded seconds.
    - **FLAC also gets `-err_detect crccheck`** (before `-i`). Without it ffmpeg
      ignores FLAC frame CRCs, and bit flips inside audio data with intact

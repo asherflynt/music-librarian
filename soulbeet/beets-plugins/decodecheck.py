@@ -153,7 +153,80 @@ IGNORED_NON_AUDIO_CODECS = frozenset(
         "av1",
     }
 )
-FFMPEG_CTX_RE = re.compile(r"^\[([A-Za-z0-9_]+)\s*@\s*0x[0-9a-fA-F]+\]")
+FFMPEG_CTX_RE = re.compile(r"^\[([A-Za-z0-9_,.-]+)\s*@\s*0x[0-9a-fA-F]+\]\s*")
+FFMPEG_REPEAT_RE = re.compile(r"^Last message repeated \d+ times$")
+
+# Exact full-line stderr messages emitted exclusively by FFmpeg's container
+# metadata / tag / attached-picture parsers (verified against FFmpeg 8.0
+# libavformat/{id3v2,apetag,flac_picture,flacdec,oggparsevorbis,mov}.c).
+# These are matched on the full line after stripping an optional single
+# ``[<ctx> @ 0x...]`` prefix (id3v2.c calls ``av_log(s, ...)`` with ``s=NULL``
+# during input open, so ID3v2 messages often arrive unprefixed).
+#
+# Conservative by design: generic decoder/container errors ("Invalid data found
+# when processing input", "Header missing", "Error while decoding stream",
+# "Skipping N bytes of junk", OOM allocation errors, etc.) are intentionally
+# excluded. Ignored metadata warnings never override a non-zero exit code,
+# truncation, or lossless no_duration verdict.
+IGNORED_METADATA_WARNINGS = frozenset(
+    {
+        # libavformat/id3v2.c
+        "Cannot read BOM value, input too short",
+        "Incorrect BOM value",
+        "Error reading lyrics, skipped",
+        "Error reading comment frame, skipped",
+        "Error reading GEOB frame, data truncated.",
+        "Error decoding attached picture description.",
+        "Failed to read tag data",
+        "Failed to read compressed tag",
+        "invalid frame id, assuming padding",
+        # libavformat/apetag.c
+        "APE tag size too large.",
+        "Error reading cover art.",
+        "Tag size is way too big",
+        "APE Tag is a header",
+        # libavformat/flac_picture.c & libavformat/flacdec.c
+        "Attached picture metadata block too short",
+        "Could not read mimetype from an attached picture.",
+        "Error parsing attached picture.",
+        "error parsing VorbisComment metadata",
+        # libavformat/oggparsevorbis.c
+        "Failed to parse cover art block.",
+        # libavformat/mov.c (metadata / cover-art atoms only)
+        "Error parsing cover art.",
+        "UDTA parsing failed retrying raw",
+        "loci too short",
+    }
+)
+
+# Anchored full-line regexes for parameterized metadata/tag-only warnings from
+# the same FFmpeg 8.0 libavformat parsers.
+IGNORED_METADATA_WARNING_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # libavformat/id3v2.c
+    re.compile(r"^Error reading frame(?: .*)?, skipped$"),
+    re.compile(r"^Failed to uncompress tag: -?\d+$"),
+    re.compile(r"^Unknown attached picture mimetype: .+, skipping\.$"),
+    re.compile(r"^Unknown attached picture type -?\d+\.$"),
+    re.compile(r"^Skipping .+ ID3v2 frame .+\.$"),
+    re.compile(r"^ID3v2\.\d+ tag skipped, cannot handle .+$"),
+    # libavformat/apetag.c
+    re.compile(r"^Unsupported tag version\. \(>=\d+\)$"),
+    re.compile(r"^Invalid tag size \d+\.$"),
+    re.compile(r"^Too many tag fields \(\d+\)$"),
+    re.compile(r"^Invalid APE tag key '.*'\.$"),
+    re.compile(r"^Skipping binary tag '.*'\.$"),
+    # libavformat/flac_picture.c
+    re.compile(r"^Invalid picture type: -?\d+\.$"),
+    re.compile(r"^Attached picture metadata block too big \d+$"),
+    re.compile(r"^Unknown attached picture mimetype: .+\.$"),
+    # libavformat/mov.c
+    re.compile(r"^loci too short \(\d+ bytes left, need at least \d+\)$"),
+    re.compile(r"^The 'keys' atom with the invalid key count: \d+$"),
+    re.compile(r"^The key# \d+ in meta has invalid size:\d+$"),
+    re.compile(r"^The index of 'data' is out of range: -?\d+ < 1 or >= -?\d+\.$"),
+    re.compile(r"^Skipping unhandled metadata .+ of type -?\d+$"),
+    re.compile(r"^Unknown cover type: 0x[0-9a-fA-F]+\.$"),
+)
 
 
 @dataclasses.dataclass
@@ -335,25 +408,55 @@ def compute_timeout(header_s: float | None) -> float:
     return max(120.0, 2.0 * h)
 
 
-def filter_ffmpeg_stderr(stderr: str | None) -> tuple[list[str], list[str]]:
-    """Split ffmpeg stderr into actionable error lines and ignored non-audio lines.
+def is_ignored_image_warning(line: str) -> bool:
+    """Return True if ``line`` comes from an allowed non-audio codec context."""
+    m = FFMPEG_CTX_RE.match(line)
+    return bool(m and m.group(1).lower() in IGNORED_NON_AUDIO_CODECS)
 
-    Lines starting with an ffmpeg log context prefix ``[<codec> @ 0x...]``
-    where ``<codec>`` is in ``IGNORED_NON_AUDIO_CODECS`` are returned in
-    ``ignored_lines``. Audio decoder errors, container/stream errors, and
+
+def is_ignored_metadata_warning(line: str) -> bool:
+    """Return True if ``line`` matches an exact known tag/metadata-only warning.
+
+    Strips at most one leading ``[<ctx> @ 0x...]`` prefix before checking full-
+    line exact literals (``IGNORED_METADATA_WARNINGS``) and anchored patterns
+    (``IGNORED_METADATA_WARNING_PATTERNS``).
+    """
+    m = FFMPEG_CTX_RE.match(line)
+    body = line[m.end() :] if m else line
+    if body in IGNORED_METADATA_WARNINGS:
+        return True
+    return any(pat.match(body) for pat in IGNORED_METADATA_WARNING_PATTERNS)
+
+
+def filter_ffmpeg_stderr(stderr: str | None) -> tuple[list[str], list[str]]:
+    """Split ffmpeg stderr into actionable error lines and ignored warnings.
+
+    Lines are moved to ``ignored_lines`` when they match either:
+    - an explicit non-audio (image/video) codec context in
+      ``IGNORED_NON_AUDIO_CODECS`` (``[<codec> @ 0x...]``), or
+    - an exact full-line metadata/tag-parsing warning in
+      ``IGNORED_METADATA_WARNINGS`` / ``IGNORED_METADATA_WARNING_PATTERNS``
+      (optionally preceded by a single ``[<ctx> @ 0x...]`` prefix), or
+    - ``Last message repeated N times`` immediately following an ignored line.
+
+    Audio decoder errors, generic container/stream errors, and all other
     unprefixed messages remain in ``error_lines``.
     """
     error_lines: list[str] = []
     ignored_lines: list[str] = []
+    prev_ignored = False
     for raw in (stderr or "").splitlines():
         line = raw.strip()
         if not line:
             continue
-        m = FFMPEG_CTX_RE.match(line)
-        if m and m.group(1).lower() in IGNORED_NON_AUDIO_CODECS:
+        if is_ignored_image_warning(line) or is_ignored_metadata_warning(line):
+            ignored_lines.append(line)
+            prev_ignored = True
+        elif prev_ignored and FFMPEG_REPEAT_RE.match(line):
             ignored_lines.append(line)
         else:
             error_lines.append(line)
+            prev_ignored = False
     return error_lines, ignored_lines
 
 
@@ -1164,7 +1267,8 @@ class DecodeCheckPlugin(BeetsPlugin):
 
         bad_entries: list[tuple[str, dict[str, Any], CheckResult]] = []
         magic_mismatches: list[dict[str, str]] = []
-        ignored_warnings: list[dict[str, str]] = []
+        ignored_image_warnings: list[dict[str, str]] = []
+        ignored_metadata_warnings: list[dict[str, str]] = []
 
         targets_to_check = targets
         if self._self_tested_bin != ffmpeg_bin:
@@ -1234,12 +1338,36 @@ class DecodeCheckPlugin(BeetsPlugin):
                         }
                     )
                 if res.ignored_warnings:
-                    ignored_warnings.append(
-                        {
-                            "basename": os.path.basename(staging_path),
-                            "warning": res.ignored_warnings[0][:MAX_DETAIL_CHARS],
-                        }
+                    first_img = next(
+                        (
+                            w
+                            for w in res.ignored_warnings
+                            if is_ignored_image_warning(w)
+                        ),
+                        None,
                     )
+                    if first_img is not None:
+                        ignored_image_warnings.append(
+                            {
+                                "basename": os.path.basename(staging_path),
+                                "warning": first_img[:MAX_DETAIL_CHARS],
+                            }
+                        )
+                    first_meta = next(
+                        (
+                            w
+                            for w in res.ignored_warnings
+                            if is_ignored_metadata_warning(w)
+                        ),
+                        None,
+                    )
+                    if first_meta is not None:
+                        ignored_metadata_warnings.append(
+                            {
+                                "basename": os.path.basename(staging_path),
+                                "warning": first_meta[:MAX_DETAIL_CHARS],
+                            }
+                        )
 
         if bad_entries:
             all_target_paths = [t[0] for t in targets]
@@ -1302,12 +1430,19 @@ class DecodeCheckPlugin(BeetsPlugin):
                     f"{m['basename']}={m['kind']}" for m in magic_mismatches
                 ),
             )
-        if ignored_warnings:
+        if ignored_image_warnings:
             self._log.info(
                 "accepted task {} ignoring {} non-audio ffmpeg warning(s): {}",
                 task_id,
-                len(ignored_warnings),
-                ignored_warnings[0]["warning"],
+                len(ignored_image_warnings),
+                ignored_image_warnings[0]["warning"],
+            )
+        if ignored_metadata_warnings:
+            self._log.info(
+                "accepted task {} ignoring {} metadata ffmpeg warning(s): {}",
+                task_id,
+                len(ignored_metadata_warnings),
+                ignored_metadata_warnings[0]["warning"],
             )
 
         checked_rec: dict[str, Any] = {
@@ -1320,9 +1455,16 @@ class DecodeCheckPlugin(BeetsPlugin):
         }
         if magic_mismatches:
             checked_rec["magic_mismatch_details"] = magic_mismatches
-        if ignored_warnings:
-            checked_rec["ignored_image_warnings"] = len(ignored_warnings)
-            checked_rec["ignored_image_warning_details"] = ignored_warnings
+        if ignored_image_warnings:
+            checked_rec["ignored_image_warnings"] = len(ignored_image_warnings)
+            checked_rec["ignored_image_warning_details"] = ignored_image_warnings
+        if ignored_metadata_warnings:
+            checked_rec["ignored_metadata_warnings"] = len(
+                ignored_metadata_warnings
+            )
+            checked_rec["ignored_metadata_warning_details"] = (
+                ignored_metadata_warnings
+            )
 
         try:
             checked_path = os.path.join(state_dir, "checked.jsonl")

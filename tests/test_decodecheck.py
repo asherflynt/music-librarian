@@ -532,6 +532,155 @@ class PureLogicTests(unittest.TestCase):
         self.assertFalse(res_nodur.ok)
         self.assertEqual(res_nodur.reason, "no_duration")
 
+    def test_id3v2_bom_and_lyrics_only_accepted(self):
+        stderr = "Incorrect BOM value\nError reading lyrics, skipped\n"
+        res = dc.evaluate_decode(
+            "/x/02 - WTF.mp3",
+            220.85,
+            "MP3",
+            0,
+            "out_time_us=220840000\nprogress=end\n",
+            stderr,
+            check_magic=False,
+        )
+        self.assertTrue(res.ok, res)
+        self.assertIsNone(res.reason)
+        self.assertEqual(res.decoded_s, 220.84)
+        self.assertEqual(
+            res.ignored_warnings,
+            ("Incorrect BOM value", "Error reading lyrics, skipped"),
+        )
+
+    def test_id3v2_bom_plus_header_missing_rejected(self):
+        stderr = (
+            "Incorrect BOM value\n"
+            "Error reading lyrics, skipped\n"
+            "[mp3float @ 0x145993720bc0] Header missing\n"
+        )
+        res = dc.evaluate_decode(
+            "/x/corrupt.mp3",
+            220.85,
+            "MP3",
+            0,
+            "out_time_us=220840000\nprogress=end\n",
+            stderr,
+            check_magic=False,
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(res.reason, "decode_error")
+        self.assertIn("Header missing", res.detail)
+        self.assertNotIn("Incorrect BOM value", res.detail)
+
+    def test_known_metadata_warnings_with_and_without_prefix_accepted(self):
+        samples = (
+            "Cannot read BOM value, input too short",
+            "[mp3 @ 0x55a01234abcd] Incorrect BOM value",
+            "[id3v2 @ 0x7f001234] Error reading comment frame, skipped",
+            "Error reading frame TXXX, skipped",
+            "Error reading frame GEOB, skipped",
+            "Error reading frame, skipped",
+            "Error reading GEOB frame, data truncated.",
+            "Error decoding attached picture description.",
+            "Failed to read tag data",
+            "Failed to read compressed tag",
+            "Failed to uncompress tag: -3",
+            "invalid frame id, assuming padding",
+            "Skipping encrypted ID3v2 frame PRIV.",
+            "ID3v2.4 tag skipped, cannot handle unsynchronisation",
+            "[mp3 @ 0x1234] APE tag size too large.",
+            "[mp3 @ 0x1234] Unsupported tag version. (>=2000)",
+            "[mp3 @ 0x1234] Invalid tag size 999999.",
+            "[mp3 @ 0x1234] Too many tag fields (70000)",
+            "[flac @ 0x1234] Attached picture metadata block too short",
+            "[flac @ 0x1234] Invalid picture type: 99.",
+            "[flac @ 0x1234] Could not read mimetype from an attached picture.",
+            "[flac @ 0x1234] Attached picture metadata block too big 50000000",
+            "[flac @ 0x1234] Error parsing attached picture.",
+            "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x1234] Error parsing cover art.",
+            "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x1234] The 'keys' atom with the invalid key count: 999999999",
+            "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x1234] The key# 1 in meta has invalid size:4",
+            "Incorrect BOM value\n    Last message repeated 3 times",
+        )
+        for sample in samples:
+            res = dc.evaluate_decode(
+                "/x/meta_warn.mp3",
+                120.0,
+                "MP3",
+                0,
+                "out_time_us=120000000\nprogress=end\n",
+                sample + "\n",
+                check_magic=False,
+            )
+            self.assertTrue(res.ok, f"expected metadata warning ignored: {sample!r} -> {res}")
+            self.assertTrue(res.ignored_warnings, sample)
+
+    def test_metadata_filter_exact_match_and_safety_conditions(self):
+        # Substrings or generic errors must NOT be ignored.
+        must_reject = (
+            "Incorrect BOM value: extra trailing error",
+            "Error while decoding stream #0:0: Incorrect BOM value",
+            "Invalid data found when processing input",
+            "Header missing",
+            "[mp3float @ 0x1234] Header missing",
+            "[mp3 @ 0x1234] Skipping 0 bytes of junk at 1024.",
+            "[flac @ 0x1234] CRC error at PTS 12345",
+            "Last message repeated 2 times",
+            "[flac @ 0x1234] invalid sync code\nLast message repeated 1 times",
+            "[aist#0:0/mp3 @ 0x1234] [dec:mp3float @ 0x5678] Error submitting packet to decoder: Invalid data found when processing input",
+        )
+        for sample in must_reject:
+            res = dc.evaluate_decode(
+                "/x/bad.mp3",
+                120.0,
+                "MP3",
+                0,
+                "out_time_us=120000000\nprogress=end\n",
+                sample + "\n",
+                check_magic=False,
+            )
+            self.assertFalse(res.ok, f"must reject: {sample!r}")
+            self.assertEqual(res.reason, "decode_error", sample)
+
+        # Ignored metadata warnings never override non-zero exit code.
+        res_rc = dc.evaluate_decode(
+            "/x/bad_rc.mp3",
+            120.0,
+            "MP3",
+            1,
+            "out_time_us=120000000\n",
+            "Incorrect BOM value\nError reading lyrics, skipped\n",
+            check_magic=False,
+        )
+        self.assertFalse(res_rc.ok)
+        self.assertEqual(res_rc.reason, "decode_error")
+        self.assertIn("status 1", res_rc.detail)
+
+        # Ignored metadata warnings never override truncation.
+        res_trunc = dc.evaluate_decode(
+            "/x/trunc.mp3",
+            120.0,
+            "MP3",
+            0,
+            "out_time_us=30000000\n",
+            "Incorrect BOM value\nError reading lyrics, skipped\n",
+            check_magic=False,
+        )
+        self.assertFalse(res_trunc.ok)
+        self.assertEqual(res_trunc.reason, "truncated")
+
+        # Ignored metadata warnings never override lossless no_duration.
+        res_nodur = dc.evaluate_decode(
+            "/x/nodur.flac",
+            0.0,
+            "FLAC",
+            0,
+            "out_time_us=120000000\n",
+            "[flac @ 0x1234] Error parsing attached picture.\n",
+            check_magic=False,
+        )
+        self.assertFalse(res_nodur.ok)
+        self.assertEqual(res_nodur.reason, "no_duration")
+
     def test_no_duration_lossless_vs_lossy(self):
         # Lossless with 0 length -> no_duration.
         res_flac = dc.evaluate_decode(
@@ -1136,6 +1285,54 @@ class RealFFmpegTests(unittest.TestCase):
                 "[mjpeg @ 0x14aae2d5d080]",
                 checked[0]["ignored_image_warning_details"][0]["warning"],
             )
+
+    def test_plugin_records_ignored_metadata_warnings_in_checked_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = Path(tmp) / "downloads"
+            state_dir = downloads / ".decodecheck"
+            alb = downloads / "Conversational Lush"
+            alb.mkdir(parents=True)
+            f1 = alb / "02 - WTF.mp3"
+            shutil.copyfile(self.good_mp3, f1)
+
+            plugin = dc.DecodeCheckPlugin()
+            plugin.config.set("state_dir", str(state_dir))
+            plugin.config.set("ffmpeg", FFMPEG_BIN)
+            plugin._self_tested_bin = FFMPEG_BIN
+
+            task = _FakeImportTask(
+                str(alb).encode(),
+                [str(alb).encode()],
+                [_FakeItem(str(f1), length=20.0, fmt="MP3", track=2)],
+            )
+            fake_res = dc.evaluate_decode(
+                str(f1),
+                20.0,
+                "MP3",
+                0,
+                "out_time_us=20000000\nprogress=end\n",
+                "Incorrect BOM value\nError reading lyrics, skipped\n",
+                check_magic=False,
+            )
+            with mock.patch.object(dc, "run_ffmpeg_decode", return_value=fake_res):
+                self.assertEqual(plugin.on_import_task_created(None, task), [task])
+
+            self.assertFalse((state_dir / "rejects.jsonl").exists())
+            checked = [
+                json.loads(ln)
+                for ln in (state_dir / "checked.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(checked), 1)
+            self.assertEqual(checked[0]["ignored_metadata_warnings"], 1)
+            self.assertEqual(
+                checked[0]["ignored_metadata_warning_details"][0]["basename"],
+                "02 - WTF.mp3",
+            )
+            self.assertEqual(
+                checked[0]["ignored_metadata_warning_details"][0]["warning"],
+                "Incorrect BOM value",
+            )
+            self.assertNotIn("ignored_image_warnings", checked[0])
 
     def test_plugin_disabled_passes_through(self):
         with tempfile.TemporaryDirectory() as tmp:
