@@ -49,7 +49,22 @@ slskd download -> /downloads (staging) -> beets import (Soulbeet)
      art would then look truncated. This was verified on real library files on
      2026-11-24: decoded 11 µs without the map, 302 s with it.
    - A file with no audio stream at all is a `decode_error`.
-   - Any stderr output, or a non-zero exit code, is a `decode_error`.
+   - Any stderr output, or a non-zero exit code, is a `decode_error` — **except**
+     stderr lines emitted by explicit non-audio (image/video) decoder contexts
+     such as `[mjpeg @ 0x...]`, `[png @ 0x...]`, `[bmp @ 0x...]`, `[gif @ 0x...]`,
+     `[webp @ 0x...]`, `[tiff @ 0x...]`, `[jpeg2000 @ 0x...]`, `[mjpegb @ 0x...]`,
+     and `[jpegls @ 0x...]` (the full explicit allowlist lives in
+     `IGNORED_NON_AUDIO_CODECS` in `decodecheck.py`). Even with `-vn`, ffmpeg
+     still probes embedded cover art (`attached_pic` streams) during input open
+     and can log e.g. `[mjpeg @ 0x...] unable to decode APP fields: Invalid data
+     found when processing input` on damaged cover art while the audio decodes
+     cleanly (verified 2026-11-25 on live rejects: 44 FLACs across 3 albums had
+     `decoded_s == header_s` with only `[mjpeg @ ...]` stderr). Ignored
+     non-audio warnings are recorded in the accepted `checked.jsonl` line
+     (`ignored_image_warnings` / `ignored_image_warning_details`) and never
+     reject; audio decoder errors (`[flac @ ...]`, `[mp3float @ ...]`,
+     `[aac @ ...]`, etc.), unprefixed stderr lines, and any non-zero exit code
+     still reject as `decode_error`.
    - The last `out_time_us` gives the decoded seconds.
    - **FLAC also gets `-err_detect crccheck`** (before `-i`). Without it ffmpeg
      ignores FLAC frame CRCs, and bit flips inside audio data with intact

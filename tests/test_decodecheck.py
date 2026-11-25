@@ -410,6 +410,128 @@ class PureLogicTests(unittest.TestCase):
         self.assertEqual(res.reason, "decode_error")
         self.assertEqual(len(res.detail), 300)
 
+    def test_mjpeg_only_stderr_full_decode_accepted(self):
+        stderr = (
+            "[mjpeg @ 0x14aae2d5d080] unable to decode APP fields: "
+            "Invalid data found when processing input\n"
+        )
+        res = dc.evaluate_decode(
+            "/x/cover_warn.flac",
+            154.6,
+            "FLAC",
+            0,
+            "out_time_us=154600000\nprogress=end\n",
+            stderr,
+            check_magic=False,
+        )
+        self.assertTrue(res.ok, res)
+        self.assertIsNone(res.reason)
+        self.assertEqual(res.decoded_s, 154.6)
+        self.assertEqual(len(res.ignored_warnings), 1)
+        self.assertIn("[mjpeg @ 0x14aae2d5d080]", res.ignored_warnings[0])
+
+    def test_mjpeg_plus_flac_error_rejected(self):
+        stderr = (
+            "[mjpeg @ 0x14aae2d5d080] unable to decode APP fields: "
+            "Invalid data found when processing input\n"
+            "[flac @ 0x55a01234abcd] CRC mismatch!\n"
+        )
+        res = dc.evaluate_decode(
+            "/x/both.flac",
+            200.0,
+            "FLAC",
+            0,
+            "out_time_us=200000000\nprogress=end\n",
+            stderr,
+            check_magic=False,
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(res.reason, "decode_error")
+        self.assertIn("[flac @ 0x55a01234abcd] CRC mismatch!", res.detail)
+        self.assertNotIn("[mjpeg @", res.detail)
+
+    def test_png_and_other_image_only_stderr_accepted(self):
+        for codec in (
+            "png",
+            "bmp",
+            "gif",
+            "webp",
+            "tiff",
+            "jpeg2000",
+            "mjpegb",
+            "jpegls",
+        ):
+            stderr = f"[{codec} @ 0x7f1234567890] corrupt picture chunk\n"
+            res = dc.evaluate_decode(
+                "/x/art.flac",
+                120.0,
+                "FLAC",
+                0,
+                "out_time_us=120000000\nprogress=end\n",
+                stderr,
+                check_magic=False,
+            )
+            self.assertTrue(res.ok, f"{codec} should be ignored: {res}")
+            self.assertEqual(len(res.ignored_warnings), 1)
+
+    def test_audio_and_unprefixed_stderr_and_nonzero_rc_still_reject(self):
+        for stderr in (
+            "[flac @ 0x1234] invalid sync code\n",
+            "[mp3float @ 0x1234] Header missing\n",
+            "[aac @ 0x1234] channel element 0.0 is not allocated\n",
+            "Invalid data found when processing input\n",
+        ):
+            res = dc.evaluate_decode(
+                "/x/bad.flac",
+                120.0,
+                "FLAC",
+                0,
+                "out_time_us=120000000\n",
+                stderr,
+                check_magic=False,
+            )
+            self.assertFalse(res.ok, stderr)
+            self.assertEqual(res.reason, "decode_error")
+
+        # Non-zero exit code must still reject even when stderr only has mjpeg.
+        res_rc = dc.evaluate_decode(
+            "/x/bad_rc.flac",
+            120.0,
+            "FLAC",
+            1,
+            "out_time_us=120000000\n",
+            "[mjpeg @ 0x1234] unable to decode APP fields\n",
+            check_magic=False,
+        )
+        self.assertFalse(res_rc.ok)
+        self.assertEqual(res_rc.reason, "decode_error")
+        self.assertIn("status 1", res_rc.detail)
+
+        # Truncation and no_duration rules still fire when mjpeg warning is ignored.
+        res_trunc = dc.evaluate_decode(
+            "/x/trunc.flac",
+            120.0,
+            "FLAC",
+            0,
+            "out_time_us=30000000\n",
+            "[mjpeg @ 0x1234] unable to decode APP fields\n",
+            check_magic=False,
+        )
+        self.assertFalse(res_trunc.ok)
+        self.assertEqual(res_trunc.reason, "truncated")
+
+        res_nodur = dc.evaluate_decode(
+            "/x/nodur.flac",
+            0.0,
+            "FLAC",
+            0,
+            "out_time_us=120000000\n",
+            "[mjpeg @ 0x1234] unable to decode APP fields\n",
+            check_magic=False,
+        )
+        self.assertFalse(res_nodur.ok)
+        self.assertEqual(res_nodur.reason, "no_duration")
+
     def test_no_duration_lossless_vs_lossy(self):
         # Lossless with 0 length -> no_duration.
         res_flac = dc.evaluate_decode(
@@ -967,6 +1089,53 @@ class RealFFmpegTests(unittest.TestCase):
                 raise RuntimeError("items exploded")
 
         self.assertEqual(plugin.on_import_task_created(None, Weird()), [])
+
+    def test_plugin_records_ignored_image_warnings_in_checked_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = Path(tmp) / "downloads"
+            state_dir = downloads / ".decodecheck"
+            alb = downloads / "Art Warn Album"
+            alb.mkdir(parents=True)
+            f1 = alb / "01 Track.flac"
+            shutil.copyfile(self.good_flac, f1)
+
+            plugin = dc.DecodeCheckPlugin()
+            plugin.config.set("state_dir", str(state_dir))
+            plugin.config.set("ffmpeg", FFMPEG_BIN)
+            plugin._self_tested_bin = FFMPEG_BIN
+
+            task = _FakeImportTask(
+                str(alb).encode(),
+                [str(alb).encode()],
+                [_FakeItem(str(f1), length=20.0, track=1)],
+            )
+            fake_res = dc.evaluate_decode(
+                str(f1),
+                20.0,
+                "FLAC",
+                0,
+                "out_time_us=20000000\nprogress=end\n",
+                "[mjpeg @ 0x14aae2d5d080] unable to decode APP fields: Invalid data found when processing input\n",
+                check_magic=False,
+            )
+            with mock.patch.object(dc, "run_ffmpeg_decode", return_value=fake_res):
+                self.assertEqual(plugin.on_import_task_created(None, task), [task])
+
+            self.assertFalse((state_dir / "rejects.jsonl").exists())
+            checked = [
+                json.loads(ln)
+                for ln in (state_dir / "checked.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(checked), 1)
+            self.assertEqual(checked[0]["ignored_image_warnings"], 1)
+            self.assertEqual(
+                checked[0]["ignored_image_warning_details"][0]["basename"],
+                "01 Track.flac",
+            )
+            self.assertIn(
+                "[mjpeg @ 0x14aae2d5d080]",
+                checked[0]["ignored_image_warning_details"][0]["warning"],
+            )
 
     def test_plugin_disabled_passes_through(self):
         with tempfile.TemporaryDirectory() as tmp:

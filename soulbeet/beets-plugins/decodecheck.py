@@ -116,6 +116,45 @@ AUDIO_EXTS = frozenset(
     }
 )
 
+# FFmpeg decoder context names for non-audio (image / video) codecs whose
+# stderr probe warnings on embedded cover art (attached_pic streams) must not
+# trigger a decode_error. Even with ``-vn``, ffmpeg probes embedded picture
+# streams when opening a file and can log e.g. ``[mjpeg @ 0x...] unable to
+# decode APP fields`` on malformed cover art while the audio decodes cleanly.
+IGNORED_NON_AUDIO_CODECS = frozenset(
+    {
+        "mjpeg",
+        "mjpegb",
+        "jpegls",
+        "jpeg2000",
+        "libopenjpeg",
+        "png",
+        "apng",
+        "bmp",
+        "gif",
+        "webp",
+        "tiff",
+        "ppm",
+        "pgm",
+        "pbm",
+        "pam",
+        "pcx",
+        "sgi",
+        "targa",
+        "psd",
+        "exr",
+        "qoi",
+        "xbm",
+        "xpm",
+        "h264",
+        "hevc",
+        "vp8",
+        "vp9",
+        "av1",
+    }
+)
+FFMPEG_CTX_RE = re.compile(r"^\[([A-Za-z0-9_]+)\s*@\s*0x[0-9a-fA-F]+\]")
+
 
 @dataclasses.dataclass
 class CheckResult:
@@ -127,6 +166,7 @@ class CheckResult:
     header_s: float | None
     decoded_s: float | None
     magic_mismatch: str | None = None
+    ignored_warnings: tuple[str, ...] = ()
 
 
 def _lower_priority() -> None:
@@ -295,6 +335,28 @@ def compute_timeout(header_s: float | None) -> float:
     return max(120.0, 2.0 * h)
 
 
+def filter_ffmpeg_stderr(stderr: str | None) -> tuple[list[str], list[str]]:
+    """Split ffmpeg stderr into actionable error lines and ignored non-audio lines.
+
+    Lines starting with an ffmpeg log context prefix ``[<codec> @ 0x...]``
+    where ``<codec>`` is in ``IGNORED_NON_AUDIO_CODECS`` are returned in
+    ``ignored_lines``. Audio decoder errors, container/stream errors, and
+    unprefixed messages remain in ``error_lines``.
+    """
+    error_lines: list[str] = []
+    ignored_lines: list[str] = []
+    for raw in (stderr or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = FFMPEG_CTX_RE.match(line)
+        if m and m.group(1).lower() in IGNORED_NON_AUDIO_CODECS:
+            ignored_lines.append(line)
+        else:
+            error_lines.append(line)
+    return error_lines, ignored_lines
+
+
 def evaluate_decode(
     path: str,
     header_s: float | None,
@@ -310,16 +372,17 @@ def evaluate_decode(
 ) -> CheckResult:
     """Apply the decode-gate rules to a completed ffmpeg invocation."""
     decoded_raw = parse_progress_out_time_s(stdout)
-    stderr_clean = (stderr or "").strip()
+    error_lines, ignored_lines = filter_ffmpeg_stderr(stderr)
+    error_text = "\n".join(error_lines)
 
     h_val = float(header_s) if header_s is not None else None
     h_rounded = _round_seconds(h_val)
 
-    # Rule 2: any stderr output or non-zero exit code -> decode_error.
-    if returncode != 0 or stderr_clean:
+    # Rule 2: any non-ignored stderr output or non-zero exit code -> decode_error.
+    if returncode != 0 or error_text:
         detail = (
-            stderr_clean[:MAX_DETAIL_CHARS]
-            if stderr_clean
+            error_text[:MAX_DETAIL_CHARS]
+            if error_text
             else f"ffmpeg exited with status {returncode}"
         )
         return CheckResult(
@@ -372,6 +435,7 @@ def evaluate_decode(
         header_s=h_rounded,
         decoded_s=d_rounded,
         magic_mismatch=magic,
+        ignored_warnings=tuple(ignored_lines),
     )
 
 
@@ -1100,6 +1164,7 @@ class DecodeCheckPlugin(BeetsPlugin):
 
         bad_entries: list[tuple[str, dict[str, Any], CheckResult]] = []
         magic_mismatches: list[dict[str, str]] = []
+        ignored_warnings: list[dict[str, str]] = []
 
         targets_to_check = targets
         if self._self_tested_bin != ffmpeg_bin:
@@ -1160,13 +1225,21 @@ class DecodeCheckPlugin(BeetsPlugin):
                         res.detail,
                     )
                     break
-            elif res.magic_mismatch:
-                magic_mismatches.append(
-                    {
-                        "basename": os.path.basename(staging_path),
-                        "kind": res.magic_mismatch,
-                    }
-                )
+            else:
+                if res.magic_mismatch:
+                    magic_mismatches.append(
+                        {
+                            "basename": os.path.basename(staging_path),
+                            "kind": res.magic_mismatch,
+                        }
+                    )
+                if res.ignored_warnings:
+                    ignored_warnings.append(
+                        {
+                            "basename": os.path.basename(staging_path),
+                            "warning": res.ignored_warnings[0][:MAX_DETAIL_CHARS],
+                        }
+                    )
 
         if bad_entries:
             all_target_paths = [t[0] for t in targets]
@@ -1229,6 +1302,13 @@ class DecodeCheckPlugin(BeetsPlugin):
                     f"{m['basename']}={m['kind']}" for m in magic_mismatches
                 ),
             )
+        if ignored_warnings:
+            self._log.info(
+                "accepted task {} ignoring {} non-audio ffmpeg warning(s): {}",
+                task_id,
+                len(ignored_warnings),
+                ignored_warnings[0]["warning"],
+            )
 
         checked_rec: dict[str, Any] = {
             "v": CONTRACT_VERSION,
@@ -1240,6 +1320,9 @@ class DecodeCheckPlugin(BeetsPlugin):
         }
         if magic_mismatches:
             checked_rec["magic_mismatch_details"] = magic_mismatches
+        if ignored_warnings:
+            checked_rec["ignored_image_warnings"] = len(ignored_warnings)
+            checked_rec["ignored_image_warning_details"] = ignored_warnings
 
         try:
             checked_path = os.path.join(state_dir, "checked.jsonl")
