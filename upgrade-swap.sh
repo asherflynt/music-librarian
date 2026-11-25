@@ -23,7 +23,7 @@ UPG_CTR="/music/_upgrades"                    # same dir, as seen inside soulbee
 LIB_HOST="/mnt/user/Media/Music"
 LIB_CTR="/music"
 BEETS_CFG="/config/config.yaml"
-LIB_DB="/music/.beets_library.db"
+LIB_DB="/data/beets-libraries/music/.beets_library.db"  # soulbeet's canonical library db (in-container)
 STATE_DB="/mnt/user/appdata/librarian/state/state.db"
 LOG="/mnt/user/appdata/librarian/upgrade-swap.log"
 
