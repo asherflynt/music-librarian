@@ -35,6 +35,11 @@ from typing import Any
 from beets.plugins import BeetsPlugin
 
 try:
+    import mutagen  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - local unit tests without mutagen
+    mutagen = None  # type: ignore[assignment]
+
+try:
     from beets.importer.tasks import (
         ArchiveImportTask,
         SentinelImportTask,
@@ -1384,12 +1389,17 @@ def _find_unreadable_album_audio(
 ) -> list[str]:
     """Find non-hidden audio files directly inside album dirs missing from task.items.
 
-    Beets' ``ImportTaskFactory.read_item`` silently drops files that mutagen
-    cannot parse at all (e.g. 0-byte or header-corrupted FLACs). Checking them
-    here prevents an incomplete album from slipping past the gate.
+    An audio file in ``task_paths`` can be absent from ``task.items`` either
+    because beets' ``ImportTaskFactory.read_item`` silently dropped a file
+    mutagen could not parse (e.g. 0-byte or header-corrupted FLACs) or because
+    a valid file arrived in the directory after ``albums_in_dir()`` snapshotted
+    it (e.g. concurrent download completion during a rescue sweep). Callers
+    must probe each returned path with :func:`probe_extra_audio` rather than
+    assuming ``header_s == 0.0``.
     """
     state_real = os.path.realpath(state_dir)
-    known = {os.path.abspath(p) for p in item_paths}
+    known_abs = {os.path.abspath(p) for p in item_paths}
+    known_real = {os.path.realpath(p) for p in item_paths}
     extras: list[str] = []
 
     for tp in task_paths:
@@ -1408,13 +1418,72 @@ def _find_unreadable_album_audio(
             if ext not in AUDIO_EXTS:
                 continue
             ap = os.path.abspath(entry.path)
-            if ap in known:
+            if ap in known_abs:
                 continue
-            if _is_within(os.path.realpath(ap), state_real):
+            rp = os.path.realpath(ap)
+            if rp in known_real:
+                continue
+            if _is_within(rp, state_real):
                 continue
             extras.append(ap)
 
     return extras
+
+
+def probe_extra_audio(
+    path: str,
+) -> tuple[float | None, str | None, str | None]:
+    """Read real header duration for an album-dir audio file absent from ``task.items``.
+
+    Returns ``(header_s, item_format, unreadable_detail)``:
+
+    - When ``mutagen`` is installed and opens ``path`` cleanly, returns
+      ``(length_s, fmt_or_none, None)`` so the caller decodes it with its true
+      header length instead of ``0.0`` (avoiding false ``no_duration`` rejects
+      on valid files that arrived concurrently after ``albums_in_dir()``).
+    - When ``mutagen`` cannot parse ``path`` (raises or returns ``None`` /
+      missing ``info``), returns ``(None, None, "unreadable by mutagen: ...")``
+      so the caller rejects it as ``decode_error`` rather than ``no_duration``.
+    - Propagates ``FileNotFoundError`` if ``path`` disappeared mid-check so
+      concurrent-import vanished-file handling triggers cleanly.
+    - When ``mutagen`` is not installed (e.g. minimal local test env), returns
+      ``(None, None, None)`` so ffmpeg still runs fail-closed.
+    """
+    if not os.path.lexists(path):
+        raise FileNotFoundError(path)
+    if mutagen is None:
+        return None, None, None
+
+    try:
+        mf = mutagen.File(path)
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        if not os.path.lexists(path):
+            raise FileNotFoundError(path) from exc
+        err_msg = str(exc).strip() or type(exc).__name__
+        return None, None, f"unreadable by mutagen: {err_msg}"[:MAX_DETAIL_CHARS]
+
+    if mf is None or getattr(mf, "info", None) is None:
+        return None, None, "unreadable by mutagen: unrecognized audio format"
+
+    raw_len = getattr(mf.info, "length", None)
+    header_s: float | None = None
+    if raw_len is not None:
+        try:
+            header_s = float(raw_len)
+        except (TypeError, ValueError):
+            header_s = None
+
+    item_format: str | None = None
+    cls_name = type(mf).__name__.upper()
+    codec = str(getattr(mf.info, "codec", "") or "").lower()
+    if cls_name == "MP4" and codec == "alac":
+        item_format = "ALAC"
+    elif cls_name in LOSSLESS_FORMATS:
+        item_format = cls_name
+
+    return header_s, item_format, None
 
 
 class DecodeCheckPlugin(BeetsPlugin):
@@ -1524,8 +1593,11 @@ class DecodeCheckPlugin(BeetsPlugin):
         item_paths = [_to_str_path(it.path) for it in items]
 
         # Build the full list of audio targets to check: all beets Items plus
-        # any unreadable audio files in album directories that mutagen skipped.
+        # any audio files in album directories absent from task.items (e.g.
+        # unreadable files skipped by read_item, or files that arrived after
+        # albums_in_dir() snapshotted the directory).
         targets: list[tuple[str, float | None, str | None, dict[str, Any]]] = []
+        pre_bad_entries: list[tuple[str, dict[str, Any], CheckResult]] = []
         for item, staging_path in zip(items, item_paths):
             raw_len = getattr(item, "length", None)
             header_s: float | None = None
@@ -1543,20 +1615,38 @@ class DecodeCheckPlugin(BeetsPlugin):
             for extra_path in _find_unreadable_album_audio(
                 task_paths, item_paths, state_dir
             ):
-                targets.append(
-                    (
-                        extra_path,
-                        0.0,
-                        None,
-                        {
-                            "artist": None,
-                            "album": None,
-                            "title": None,
-                            "albumartist": None,
-                            "track": None,
-                        },
+                empty_meta = {
+                    "artist": None,
+                    "album": None,
+                    "title": None,
+                    "albumartist": None,
+                    "track": None,
+                }
+                try:
+                    extra_header_s, extra_fmt, unreadable_detail = (
+                        probe_extra_audio(extra_path)
                     )
-                )
+                except FileNotFoundError:
+                    return self._abort_vanished(task_paths, extra_path)
+
+                if unreadable_detail is not None:
+                    pre_bad_entries.append(
+                        (
+                            extra_path,
+                            empty_meta,
+                            CheckResult(
+                                ok=False,
+                                reason="decode_error",
+                                detail=unreadable_detail,
+                                header_s=None,
+                                decoded_s=None,
+                            ),
+                        )
+                    )
+                else:
+                    targets.append(
+                        (extra_path, extra_header_s, extra_fmt, empty_meta)
+                    )
 
         bad_entries: list[tuple[str, dict[str, Any], CheckResult]] = []
         magic_mismatches: list[dict[str, str]] = []
@@ -1564,6 +1654,7 @@ class DecodeCheckPlugin(BeetsPlugin):
         ignored_metadata_warnings: list[dict[str, str]] = []
         trailing_tags: list[dict[str, str]] = []
 
+        total_task_files = len(targets) + len(pre_bad_entries)
         targets_to_check = targets
         if self._self_tested_bin != ffmpeg_bin:
             st_err = ffmpeg_self_test(ffmpeg_bin)
@@ -1670,8 +1761,15 @@ class DecodeCheckPlugin(BeetsPlugin):
                             }
                         )
 
+        if pre_bad_entries and not any(
+            r.reason == "checker_unavailable" for _, _, r in bad_entries
+        ):
+            bad_entries.extend(pre_bad_entries)
+
         if bad_entries:
-            all_target_paths = [t[0] for t in targets]
+            all_target_paths = [t[0] for t in targets] + [
+                p for p, _, _ in pre_bad_entries
+            ]
             gone = [p for p in all_target_paths if not os.path.lexists(p)]
             if gone:
                 return self._abort_vanished(task_paths, gone[0])
@@ -1695,7 +1793,7 @@ class DecodeCheckPlugin(BeetsPlugin):
                     staging_path=staging_path,
                     quarantined_to=moved_map.get(os.path.abspath(staging_path)),
                     item_meta=meta,
-                    task_files=len(targets),
+                    task_files=total_task_files,
                     task_bad=len(bad_entries),
                     album_mode=album_mode,
                 )
@@ -1715,7 +1813,7 @@ class DecodeCheckPlugin(BeetsPlugin):
                 "rejected task {} ({}/{} bad, moved {} file(s) to {}): {}",
                 task_id,
                 len(bad_entries),
-                len(targets),
+                total_task_files,
                 len(moved_map),
                 q_dir,
                 reasons,

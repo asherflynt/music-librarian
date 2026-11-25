@@ -1640,6 +1640,254 @@ class RealFFmpegTests(unittest.TestCase):
                 [{"basename": "100 - Squatty Roo.flac", "kind": "id3v1"}],
             )
 
+    def test_probe_extra_audio_mutagen_valid_unreadable_and_vanished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            p = root / "track.flac"
+            p.write_bytes(b"placeholder")
+
+            class FLAC:
+                def __init__(self, length):
+                    self.info = types.SimpleNamespace(length=length)
+
+            class MP4:
+                def __init__(self, length, codec="alac"):
+                    self.info = types.SimpleNamespace(length=length, codec=codec)
+
+            # Valid FLAC length.
+            fake_mut = types.SimpleNamespace(File=lambda _p: FLAC(189.4))
+            with mock.patch.object(dc, "mutagen", fake_mut):
+                self.assertEqual(dc.probe_extra_audio(str(p)), (189.4, "FLAC", None))
+
+            # ALAC inside M4A.
+            fake_mut = types.SimpleNamespace(File=lambda _p: MP4(210.5, "alac"))
+            with mock.patch.object(dc, "mutagen", fake_mut):
+                self.assertEqual(dc.probe_extra_audio(str(p)), (210.5, "ALAC", None))
+
+            # Zero-duration FLAC (real STREAMINFO total_samples=0).
+            fake_mut = types.SimpleNamespace(File=lambda _p: FLAC(0.0))
+            with mock.patch.object(dc, "mutagen", fake_mut):
+                self.assertEqual(dc.probe_extra_audio(str(p)), (0.0, "FLAC", None))
+
+            # Unreadable: mutagen raises an exception.
+            def _boom(_p):
+                raise ValueError("not a valid FLAC file")
+
+            fake_mut = types.SimpleNamespace(File=_boom)
+            with mock.patch.object(dc, "mutagen", fake_mut):
+                hdr, fmt, err = dc.probe_extra_audio(str(p))
+                self.assertIsNone(hdr)
+                self.assertIsNone(fmt)
+                self.assertEqual(err, "unreadable by mutagen: not a valid FLAC file")
+
+            # Unreadable: mutagen returns None.
+            fake_mut = types.SimpleNamespace(File=lambda _p: None)
+            with mock.patch.object(dc, "mutagen", fake_mut):
+                hdr, fmt, err = dc.probe_extra_audio(str(p))
+                self.assertIsNone(hdr)
+                self.assertIsNone(fmt)
+                self.assertTrue(err and err.startswith("unreadable by mutagen: "))
+
+            # Vanished file raises FileNotFoundError.
+            with self.assertRaises(FileNotFoundError):
+                dc.probe_extra_audio(str(root / "missing.flac"))
+
+    def test_extra_readable_flac_in_album_dir_passes_with_real_mutagen_length(self):
+        # Regression test for 2026-11-25 live bug: a valid FLAC arrives in the
+        # album directory after albums_in_dir() snapshotted it (e.g. concurrent
+        # slskd download during rescue-sweep), so it is absent from task.items.
+        # Must probe its real header duration via mutagen and PASS instead of
+        # hardcoding header_s=0.0 and falsely rejecting as no_duration.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = Path(tmp) / "downloads"
+            state_dir = downloads / ".decodecheck"
+            alb = downloads / "The Complete Ella Fitzgerald Song Books [8ad0f3cc]"
+            alb.mkdir(parents=True)
+            f1 = alb / "01 Track.flac"
+            f_extra = alb / "04 - Somebody From Somewhere.flac"
+            shutil.copyfile(self.good_flac, f1)
+            shutil.copyfile(self.good_flac, f_extra)
+
+            class FLAC:
+                info = types.SimpleNamespace(length=20.0)
+
+            plugin = dc.DecodeCheckPlugin()
+            plugin.config.set("state_dir", str(state_dir))
+            plugin.config.set("ffmpeg", FFMPEG_BIN)
+            # Only f1 is in task.items; f_extra is present on disk in the album dir.
+            task = _FakeImportTask(
+                str(alb).encode(),
+                [str(alb).encode()],
+                [_FakeItem(str(f1), length=20.0, fmt="FLAC", track=1)],
+            )
+            fake_mut = types.SimpleNamespace(File=lambda _p: FLAC())
+            with mock.patch.object(dc, "mutagen", fake_mut):
+                out = plugin.on_import_task_created(None, task)
+
+            self.assertEqual(out, [task])
+            self.assertFalse((state_dir / "rejects.jsonl").exists())
+            checked = [
+                json.loads(ln)
+                for ln in (state_dir / "checked.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(checked), 1)
+            self.assertEqual(checked[0]["files"], 2)
+
+    def test_extra_unreadable_flac_rejected_as_decode_error_not_no_duration(self):
+        # Genuinely unreadable extra file (mutagen raises or returns None) must
+        # still reject & quarantine the whole album, with reason decode_error
+        # and detail "unreadable by mutagen: <exc>" (never no_duration).
+        for mode in ("raises", "returns_none"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                downloads = Path(tmp) / "downloads"
+                state_dir = downloads / ".decodecheck"
+                alb = downloads / "Album With Unreadable Extra"
+                alb.mkdir(parents=True)
+                f1 = alb / "01 Good.flac"
+                f_bad = alb / "05 Corrupt.flac"
+                shutil.copyfile(self.good_flac, f1)
+                f_bad.write_bytes(b"\x00" * 64)
+
+                def _fake_open(_p, _mode=mode):
+                    if _mode == "raises":
+                        raise RuntimeError("not a valid FLAC file")
+                    return None
+
+                plugin = dc.DecodeCheckPlugin()
+                plugin.config.set("state_dir", str(state_dir))
+                plugin.config.set("ffmpeg", FFMPEG_BIN)
+                task = _FakeImportTask(
+                    str(alb).encode(),
+                    [str(alb).encode()],
+                    [_FakeItem(str(f1), length=20.0, fmt="FLAC", track=1)],
+                )
+                fake_mut = types.SimpleNamespace(File=_fake_open)
+                with mock.patch.object(dc, "mutagen", fake_mut):
+                    out = plugin.on_import_task_created(None, task)
+
+                self.assertEqual(out, [])
+                self.assertFalse(alb.exists())
+                recs = [
+                    json.loads(ln)
+                    for ln in (state_dir / "rejects.jsonl").read_text().splitlines()
+                ]
+                self.assertEqual(len(recs), 1)
+                rec = recs[0]
+                self.assertEqual(rec["reason"], "decode_error")
+                self.assertEqual(rec["basename"], "05 Corrupt.flac")
+                self.assertTrue(
+                    rec["detail"].startswith("unreadable by mutagen: "),
+                    rec["detail"],
+                )
+                if mode == "raises":
+                    self.assertIn("not a valid FLAC file", rec["detail"])
+                self.assertIsNone(rec["header_s"])
+                self.assertIsNone(rec["decoded_s"])
+                self.assertEqual(rec["task_files"], 2)
+                self.assertEqual(rec["task_bad"], 1)
+                q_dir = Path(rec["quarantined_to"]).parent
+                self.assertTrue((q_dir / "01 Good.flac").exists())
+                self.assertTrue((q_dir / "05 Corrupt.flac").exists())
+
+    def test_extra_zero_duration_and_corrupt_body_flacs_still_rejected(self):
+        # Fail-closed check: even when mutagen opens an extra file, a genuine
+        # total_samples=0 FLAC still rejects as no_duration, and a corrupt-body
+        # FLAC with a valid header still rejects as decode_error.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = Path(tmp) / "downloads"
+            state_dir = downloads / ".decodecheck"
+            plugin = dc.DecodeCheckPlugin()
+            plugin.config.set("state_dir", str(state_dir))
+            plugin.config.set("ffmpeg", FFMPEG_BIN)
+
+            class FLAC:
+                def __init__(self, length):
+                    self.info = types.SimpleNamespace(length=length)
+
+            # Case 1: genuine zero-duration FLAC extra -> no_duration
+            alb1 = downloads / "Zero Extra"
+            alb1.mkdir(parents=True)
+            f1 = alb1 / "01 Good.flac"
+            f2 = alb1 / "02 ZeroDur.flac"
+            shutil.copyfile(self.good_flac, f1)
+            shutil.copyfile(self.nodur_flac, f2)
+            t1 = _FakeImportTask(
+                str(alb1).encode(),
+                [str(alb1).encode()],
+                [_FakeItem(str(f1), length=20.0, fmt="FLAC", track=1)],
+            )
+            with mock.patch.object(
+                dc, "mutagen", types.SimpleNamespace(File=lambda _p: FLAC(0.0))
+            ):
+                self.assertEqual(plugin.on_import_task_created(None, t1), [])
+
+            # Case 2: valid header but corrupt audio body extra -> decode_error
+            alb2 = downloads / "Corrupt Body Extra"
+            alb2.mkdir(parents=True)
+            g1 = alb2 / "01 Good.flac"
+            g2 = alb2 / "02 CorruptBody.flac"
+            shutil.copyfile(self.good_flac, g1)
+            shutil.copyfile(self.corrupt_flac, g2)
+            t2 = _FakeImportTask(
+                str(alb2).encode(),
+                [str(alb2).encode()],
+                [_FakeItem(str(g1), length=20.0, fmt="FLAC", track=1)],
+            )
+            with mock.patch.object(
+                dc, "mutagen", types.SimpleNamespace(File=lambda _p: FLAC(20.0))
+            ):
+                self.assertEqual(plugin.on_import_task_created(None, t2), [])
+
+            recs = [
+                json.loads(ln)
+                for ln in (state_dir / "rejects.jsonl").read_text().splitlines()
+            ]
+            by_base = {r["basename"]: r for r in recs}
+            self.assertEqual(by_base["02 ZeroDur.flac"]["reason"], "no_duration")
+            self.assertEqual(by_base["02 ZeroDur.flac"]["header_s"], 0.0)
+            self.assertEqual(by_base["02 CorruptBody.flac"]["reason"], "decode_error")
+            self.assertEqual(by_base["02 CorruptBody.flac"]["header_s"], 20.0)
+
+    def test_extra_vanished_during_probe_aborts_and_symlink_dedup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = Path(tmp) / "downloads"
+            state_dir = downloads / ".decodecheck"
+            real_alb = downloads / "Real Album"
+            real_alb.mkdir(parents=True)
+            link_alb = downloads / "Link Album"
+            link_alb.symlink_to(real_alb)
+            f1 = real_alb / "01 Track.flac"
+            shutil.copyfile(self.good_flac, f1)
+
+            # Symlinked task_path vs realpath item_path -> not treated as extra.
+            extras = dc._find_unreadable_album_audio(
+                [str(link_alb)], [str(f1)], str(state_dir)
+            )
+            self.assertEqual(extras, [])
+
+            # Vanished extra during probe -> aborts without reject or quarantine.
+            f_extra = real_alb / "02 Vanishing.flac"
+            shutil.copyfile(self.good_flac, f_extra)
+
+            def _vanish(p):
+                os.unlink(p)
+                raise FileNotFoundError(p)
+
+            plugin = dc.DecodeCheckPlugin()
+            plugin.config.set("state_dir", str(state_dir))
+            plugin.config.set("ffmpeg", FFMPEG_BIN)
+            task = _FakeImportTask(
+                str(real_alb).encode(),
+                [str(real_alb).encode()],
+                [_FakeItem(str(f1), length=20.0, fmt="FLAC", track=1)],
+            )
+            with mock.patch.object(
+                dc, "mutagen", types.SimpleNamespace(File=_vanish)
+            ):
+                self.assertEqual(plugin.on_import_task_created(None, task), [])
+            self.assertFalse((state_dir / "rejects.jsonl").exists())
+            self.assertFalse((state_dir / "quarantine").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

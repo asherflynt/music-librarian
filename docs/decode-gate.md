@@ -106,6 +106,24 @@ slskd download -> /downloads (staging) -> beets import (Soulbeet)
    header - max(5 s, 5%), the reason is `truncated`.
 4. **No duration:** if the header length is 0 or missing for a lossless file,
    the reason is `no_duration` (a FLAC with STREAMINFO total_samples=0).
+   - **Extra audio files in album directories:** for album tasks, the plugin
+     also scans `task.paths` for non-hidden audio files absent from
+     `task.items` (either files beets' `ImportTaskFactory.read_item` silently
+     dropped as unreadable, or valid files that arrived in staging after
+     `albums_in_dir()` snapshotted the folder — e.g. concurrent slskd download
+     completion during `rescue-sweep`). Each extra file is probed via
+     `mutagen.File(path)` for its real header duration rather than assuming
+     `0.0`:
+     - If `mutagen.File` cannot open the file at all (raises an error or
+       returns `None`), the file is genuinely unreadable and is rejected as
+       `decode_error` with detail `unreadable by mutagen: <exc>` (never
+       `no_duration`).
+     - If `mutagen.File` succeeds, the file is decoded with ffmpeg using its
+       real header duration so valid concurrent arrivals pass, while genuinely
+       corrupt, truncated, or zero-duration (`total_samples=0`) lossless files
+       still reject.
+     - If the file disappears before or during probing, concurrent-import
+       vanished-file handling aborts the task without rejecting or quarantining.
 5. **Magic mismatch** (e.g. ID3v2 prepended to a FLAC) is logged in the accepted
    line, never rejected. It is cosmetic.
 6. The per-file timeout is `max(120 s, 2 x header length)`. A timeout is
