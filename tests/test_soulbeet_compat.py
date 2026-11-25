@@ -945,5 +945,189 @@ class TestBackendBackoff(unittest.TestCase):
         self.assertEqual(librarian.backend_backoff_seconds(100), 900)
 
 
+class TestSoulbeetQueueTimeouts(unittest.TestCase):
+    def _with_temp_state(self):
+        tmp = tempfile.TemporaryDirectory()
+        tmp_path = pathlib.Path(tmp.name)
+        patches = [
+            mock.patch.object(librarian, "DATA_DIR", tmp_path),
+            mock.patch.object(librarian, "STATE_DB", tmp_path / "state.db"),
+        ]
+        for p in patches:
+            p.start()
+        st = librarian.State()
+
+        def cleanup():
+            st.conn.close()
+            for p in reversed(patches):
+                p.stop()
+            tmp.cleanup()
+
+        self.addCleanup(cleanup)
+        return st
+
+    def test_queue_timeout_scaling_and_session_timeout_arg(self):
+        self.assertEqual(librarian.queue_timeout_seconds(0), 120)
+        self.assertEqual(librarian.queue_timeout_seconds(1), 122)
+        self.assertEqual(librarian.queue_timeout_seconds(10), 140)
+        self.assertEqual(librarian.queue_timeout_seconds(200), 520)
+        self.assertEqual(librarian.queue_timeout_seconds(390), 900)
+        self.assertEqual(librarian.queue_timeout_seconds(1000), 900)
+
+        # Verify floor when base is lowered
+        with mock.patch.object(librarian, "QUEUE_TIMEOUT_BASE_SEC", 10):
+            self.assertEqual(librarian.queue_timeout_seconds(0), librarian.QUEUE_TIMEOUT_MIN_SEC)
+
+        # Verify Soulbeet.queue forwards the scaled timeout to requests.Session.post
+        for count, expected in ((1, 122), (200, 520), (500, 900)):
+            with self.subTest(count=count):
+                sb = _make_session_soulbeet(
+                    post_return_value=_mock_response(200, json_data=[{"id": "dl-1", "status": "Enqueued"}])
+                )
+                items = [POLL_FLAC_GROUP["items"][0]] * count
+                sb.queue(items, LIVE_SEARCH_ID)
+                self.assertEqual(sb.s.post.call_args.kwargs["timeout"], expected)
+
+    def test_queue_read_timeout_marks_candidate_queued_without_backend_unavailable(self):
+        st = self._with_temp_state()
+        st.add_candidate("Ella Fitzgerald", "The Complete Song Books", "album", priority=50)
+        row = st.pending_candidates(limit=1)[0]
+
+        def session_post(url, json=None, timeout=None):
+            if url.endswith("/api/metadata/search/album"):
+                return _mock_response(200, json_data=LIVE_SEARCH_ALBUM_LIST)
+            if url.endswith("/api/download/search/start"):
+                return _mock_response(200, json_data=LIVE_SEARCH_ID)
+            if url.endswith("/api/download/search/poll"):
+                return _mock_response(200, json_data={"state": "Completed", "groups": [POLL_FLAC_GROUP]})
+            if url.endswith("/api/downloads/queue"):
+                raise requests.ReadTimeout(f"Read timed out. (read timeout={timeout})")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        sb = _make_session_soulbeet(post_side_effect=session_post)
+        secrets = {"SOULBEET_USER": "u", "SOULBEET_PASS": "p"}
+        down_ev = threading.Event()
+
+        with mock.patch.object(librarian, "navidrome_album_exists", return_value=False), \
+             mock.patch.object(librarian, "log") as log_mock:
+            res = librarian.process_candidate(st, sb, secrets, row, backend_down=down_ev)
+
+        self.assertEqual(res, "queued_flac")
+        self.assertFalse(down_ev.is_set())
+        status, fmt, kbps, attempts = st.conn.execute(
+            "SELECT status, fmt, kbps, attempts FROM candidates WHERE key=?", (row[0],)
+        ).fetchone()
+        self.assertEqual((status, fmt, kbps, attempts), ("queued_flac", "flac", 950, 0))
+
+        # Decode-gate downloads row is still recorded so corrupt rejects can match
+        dl_rows = st.conn.execute(
+            "SELECT kind, ref_key, search_id FROM downloads WHERE ref_key=?", (row[0],)
+        ).fetchall()
+        self.assertEqual(dl_rows, [("candidate", row[0], LIVE_SEARCH_ID)])
+
+        logged = "\n".join(str(c.args[0]) for c in log_mock.call_args_list)
+        self.assertIn("queue response timed out after 122s", logged)
+        self.assertIn("Ella Fitzgerald - The Complete Song Books", logged)
+        self.assertIn("assuming queued", logged)
+
+    def test_queue_read_timeout_marks_upgrade_queued_without_backend_unavailable(self):
+        st = self._with_temp_state()
+        st.put_files([
+            ("/music/Ella/SongBooks/01.mp3", "/music/Ella/SongBooks",
+             "Ella Fitzgerald", "Song Books", "mp3", 0, 320, 1000, 100, 100),
+        ])
+        cand = st.lossy_albums(limit=5, older_than=0)[0]
+
+        def session_post(url, json=None, timeout=None):
+            if url.endswith("/api/metadata/search/album"):
+                return _mock_response(200, json_data=LIVE_SEARCH_ALBUM_LIST)
+            if url.endswith("/api/download/search/start"):
+                return _mock_response(200, json_data=LIVE_SEARCH_ID)
+            if url.endswith("/api/download/search/poll"):
+                return _mock_response(200, json_data={"state": "Completed", "groups": [POLL_FLAC_GROUP]})
+            if url.endswith("/api/downloads/queue"):
+                raise requests.ReadTimeout("Read timed out.")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        sb = _make_session_soulbeet(post_side_effect=session_post)
+        with mock.patch.object(librarian, "log") as log_mock:
+            res = librarian.upgrade_one(st, sb, cand, {})
+
+        self.assertEqual(res, "queued")
+        up_status = st.conn.execute(
+            "SELECT status FROM upgrades WHERE key=?", (cand["key"],)
+        ).fetchone()[0]
+        self.assertEqual(up_status, "queued")
+        dl_rows = st.conn.execute(
+            "SELECT kind, ref_key, search_id FROM downloads WHERE ref_key=?", (cand["key"],)
+        ).fetchall()
+        self.assertEqual(dl_rows, [("upgrade", cand["key"], LIVE_SEARCH_ID)])
+        logged = "\n".join(str(c.args[0]) for c in log_mock.call_args_list)
+        self.assertIn("queue response timed out after 122s", logged)
+        self.assertIn("assuming queued", logged)
+
+    def test_queue_connect_timeout_and_connection_error_raise_backend_unavailable(self):
+        items = POLL_FLAC_GROUP["items"][:1]
+        for exc in (
+            requests.ConnectTimeout("connect timed out"),
+            requests.ConnectionError("connection refused"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                sb = _make_session_soulbeet(post_side_effect=exc)
+                with self.assertRaises(librarian.BackendUnavailable):
+                    sb.queue(items, LIVE_SEARCH_ID)
+
+        # End-to-end: ConnectTimeout on queue triggers backend_down and leaves pending
+        st = self._with_temp_state()
+        st.add_candidate("Devault", "Sensation", "album", priority=10)
+        row = st.pending_candidates(limit=1)[0]
+
+        def session_post(url, json=None, timeout=None):
+            if url.endswith("/api/metadata/search/album"):
+                return _mock_response(200, json_data=LIVE_SEARCH_ALBUM_LIST)
+            if url.endswith("/api/download/search/start"):
+                return _mock_response(200, json_data=LIVE_SEARCH_ID)
+            if url.endswith("/api/download/search/poll"):
+                return _mock_response(200, json_data={"state": "Completed", "groups": [POLL_FLAC_GROUP]})
+            if url.endswith("/api/downloads/queue"):
+                raise requests.ConnectTimeout("connect timed out")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        sb = _make_session_soulbeet(post_side_effect=session_post)
+        down_ev = threading.Event()
+        with mock.patch.object(librarian, "navidrome_album_exists", return_value=False):
+            res = librarian.process_candidate(
+                st, sb, {"SOULBEET_USER": "u", "SOULBEET_PASS": "p"}, row, backend_down=down_ev
+            )
+        self.assertEqual(res, "backend_down")
+        self.assertTrue(down_ev.is_set())
+        self.assertEqual(
+            st.conn.execute("SELECT status FROM candidates WHERE key=?", (row[0],)).fetchone()[0],
+            "pending",
+        )
+        self.assertEqual(st.conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0], 0)
+
+    def test_read_timeout_on_other_endpoints_still_raises_backend_unavailable(self):
+        sb = _make_session_soulbeet(post_side_effect=requests.ReadTimeout("read timed out"))
+        with self.assertRaises(librarian.BackendUnavailable):
+            sb.search_album("Devault", "Sensation")
+        with self.assertRaises(librarian.BackendUnavailable):
+            sb.search_track("Devault", "Behind the Wheel")
+        with self.assertRaises(librarian.BackendUnavailable):
+            sb.start_search(LIVE_SEARCH_ALBUM_LIST[0], [])
+        with self.assertRaises(librarian.BackendUnavailable):
+            sb.poll(LIVE_SEARCH_ID)
+
+    def test_queue_401_reauth_then_read_timeout_is_unconfirmed(self):
+        unauth = _mock_response(401, text="expired")
+        sb = _make_session_soulbeet(
+            post_side_effect=[unauth, requests.ReadTimeout("read timed out")]
+        )
+        res = sb.queue(POLL_FLAC_GROUP["items"][:1], LIVE_SEARCH_ID)
+        self.assertEqual(res, {"unconfirmed": True, "timeout": 122})
+        sb.login.assert_called_once()
+        self.assertEqual(sb.s.post.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

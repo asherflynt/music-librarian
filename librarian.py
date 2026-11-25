@@ -1029,6 +1029,23 @@ class BackendUnavailable(RuntimeError):
 
 _TRANSIENT_HTTP_CODES = frozenset({502, 503, 504})
 
+# /api/downloads/queue scales with item count: Soulbeet enqueues each file
+# synchronously in slskd and starts monitoring before replying, which can exceed
+# the default 60s timeout on multi-disc box sets (hundreds of files).
+QUEUE_TIMEOUT_BASE_SEC = 120
+QUEUE_TIMEOUT_PER_ITEM_SEC = 2
+QUEUE_TIMEOUT_MIN_SEC = 60
+QUEUE_TIMEOUT_MAX_SEC = 900  # 15 min cap
+
+
+def queue_timeout_seconds(item_count):
+    """HTTP timeout (seconds) for /api/downloads/queue, scaled by item count."""
+    n = max(0, int(item_count or 0))
+    return min(
+        QUEUE_TIMEOUT_MAX_SEC,
+        max(QUEUE_TIMEOUT_MIN_SEC, QUEUE_TIMEOUT_BASE_SEC + QUEUE_TIMEOUT_PER_ITEM_SEC * n),
+    )
+
 
 def _truncate_body(text, limit=300):
     s = " ".join((text or "").split())
@@ -1088,9 +1105,13 @@ class Soulbeet:
             r.raise_for_status()
             log("Soulbeet: authenticated")
 
-    def _post(self, path, body, timeout=60, _retry=True):
+    def _post(self, path, body, timeout=60, _retry=True, allow_read_timeout=False):
         try:
             r = self.s.post(f"{SOULBEET_URL}{path}", json=body, timeout=timeout)
+        except requests.ReadTimeout as e:
+            if allow_read_timeout:
+                raise
+            raise BackendUnavailable(f"Soulbeet {path} unreachable: {e}") from e
         except (requests.ConnectionError, requests.Timeout) as e:
             raise BackendUnavailable(f"Soulbeet {path} unreachable: {e}") from e
         if r.status_code in (401, 403) and _retry:
@@ -1103,7 +1124,8 @@ class Soulbeet:
                 if e.response is not None and e.response.status_code in _TRANSIENT_HTTP_CODES:
                     raise BackendUnavailable(f"Soulbeet login HTTP {e.response.status_code}") from e
                 raise
-            return self._post(path, body, timeout, _retry=False)
+            return self._post(path, body, timeout, _retry=False,
+                              allow_read_timeout=allow_read_timeout)
         if r.status_code >= 400:
             raw_text = getattr(r, "text", "")
             body_text = raw_text if isinstance(raw_text, str) else ""
@@ -1164,11 +1186,19 @@ class Soulbeet:
             time.sleep(3)
 
     def queue(self, items, search_id, target_folder=None):
-        res = self._post("/api/downloads/queue",
-                         {"req": {"items": items,
-                                  "search_id": search_id,
-                                  "target_folder": target_folder or TARGET_FOLDER,
-                                  "backend": None}})
+        timeout = queue_timeout_seconds(len(items))
+        try:
+            res = self._post(
+                "/api/downloads/queue",
+                {"req": {"items": items,
+                         "search_id": search_id,
+                         "target_folder": target_folder or TARGET_FOLDER,
+                         "backend": None}},
+                timeout=timeout,
+                allow_read_timeout=True,
+            )
+        except requests.ReadTimeout:
+            return {"unconfirmed": True, "timeout": timeout}
         errs = queue_response_errors(res, expected_count=len(items))
         if errs:
             raise RuntimeError(f"Soulbeet queue failed: {'; '.join(errs)}")
@@ -2220,7 +2250,11 @@ def process_candidate(state, sb, secrets, row, backend_down=None, cfg=None):
         status, items, info = pick_by_quality_ladder(
             res.get("groups", []), blocked=_blocked_for(state, key, cfg))
         if items:
-            sb.queue(items, sid)
+            qres = sb.queue(items, sid)
+            if isinstance(qres, dict) and qres.get("unconfirmed"):
+                log(f"  queue response timed out after {qres.get('timeout')}s "
+                    f"for {artist} - {album}; assuming queued "
+                    f"(Soulbeet usually finishes queuing)")
             _record_downloads_safe(state, "candidate", key, items, sid)
 
         # Document every non-FLAC outcome explicitly: what it fell back to and why.
@@ -2629,7 +2663,11 @@ def upgrade_one(state, sb, cand, cfg):
             return "no_flac"
         # Stage it, never straight into the library: nothing replaces a file you
         # already have until the swap script has verified it end to end.
-        sb.queue(items, sid, target_folder=UPGRADE_FOLDER)
+        qres = sb.queue(items, sid, target_folder=UPGRADE_FOLDER)
+        if isinstance(qres, dict) and qres.get("unconfirmed"):
+            log(f"  queue response timed out after {qres.get('timeout')}s "
+                f"for {artist} - {album} (upgrade); assuming queued "
+                f"(Soulbeet usually finishes queuing)")
         _record_downloads_safe(state, "upgrade", key, items, sid)
         record("queued", f"flac @ ~{(info or {}).get('kbps', 0)} kbps staged")
         log(f"  UPGRADE [{artist} - {album}]: {cand['codec']} @ ~{cand['kbps']} kbps "
