@@ -37,9 +37,10 @@ import time
 import unicodedata
 
 DL = "/downloads"
-LIB_DB = "/music/.beets_library.db"
+LIB_DB = "/data/beets-libraries/music/.beets_library.db"
 LIB_DIR = "/music"
 BEETS_CFG = "/config/config.yaml"
+SETTLE_SECONDS = 900  # skip staging folders modified within the last 15 minutes
 AUDIO = (".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".wma")
 
 
@@ -136,6 +137,21 @@ def beets_import(folder, singleton):
         return 1, "timed out after 300s"
 
 
+def is_busy(d, now=None):
+    """True if any file inside d (recursively) was modified within SETTLE_SECONDS."""
+    if now is None:
+        now = time.time()
+    cutoff = now - SETTLE_SECONDS
+    for root, _, fs in os.walk(d):
+        for f in fs:
+            try:
+                if os.path.getmtime(os.path.join(root, f)) >= cutoff:
+                    return True
+            except OSError:
+                pass
+    return False
+
+
 def staging_folders(root):
     """Top-level staging folders to drain. Dot-directories are never touched:
     /downloads/.decodecheck holds the decode-gate quarantine and rejects.jsonl
@@ -159,12 +175,15 @@ def main():
     folders = staging_folders(DL)
     log(f"staging: {len(folders)} folder(s){'  [DRY RUN — nothing will change]' if args.dry_run else ''}")
 
-    stats = {"deleted": 0, "imported": 0, "empty": 0, "kept": 0, "failed": 0}
+    stats = {"deleted": 0, "imported": 0, "busy": 0, "empty": 0, "kept": 0, "failed": 0}
     freed = 0
     for i, name in enumerate(folders, 1):
         if args.limit and i > args.limit:
             break
         d = os.path.join(DL, name)
+        if is_busy(d):
+            stats["busy"] += 1
+            continue
         files = audio_files(d)
 
         if not files:
@@ -212,6 +231,7 @@ def main():
     log("=" * 62)
     log(f"deleted (verified duplicates): {stats['deleted']}")
     log(f"imported into library:         {stats['imported']}")
+    log(f"busy (active downloads):       {stats['busy']}")
     log(f"empty folders removed:         {stats['empty']}")
     log(f"kept (beets declined):         {stats['kept']}")
     log(f"failed:                        {stats['failed']}")
