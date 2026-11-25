@@ -5,19 +5,27 @@
 # completed download under sustained concurrent load: fully-downloaded albums can
 # sit in slskd's staging dir with no import ever attempted. This re-runs the exact
 # beet import Soulbeet uses internally, via `docker exec` into the soulbeet
-# container, so it uses the canonical beets version + config (no second beets
-# install, no version drift, no docker.sock exposed to a container).
+# container against Soulbeet's canonical library DB
+# (/data/beets-libraries/music/.beets_library.db), so it uses the canonical beets
+# version + config (no second beets install, no version drift, no docker.sock
+# exposed to a container).
+#
+# Settle guard: slskd downloads files into /app/incomplete and moves each track
+# into /app/downloads as it finishes, so an active album folder accumulates files
+# over time. Any folder with a file modified in the last 15 minutes is skipped as
+# busy so we never import an incomplete album.
 #
 # Idempotent: beets recognizes anything already in the library and skips it fast.
 # Only imports what's already downloaded; never starts a download.
 #
 # Install: /boot/config/plugins/user.scripts/scripts/librarian-rescue-sweep/script
 
-DL_HOST="/mnt/cluster/Media/slskd_downloads"   # staging, as seen from the host
-DL_CTR="/downloads"                            # same dir, as seen inside soulbeet
-BEETS_CFG="/config/config.yaml"                # soulbeet's beets config (in-container)
-LIB_DB="/music/.beets_library.db"              # shared library db (in-container)
-TARGET="/music"                                # library destination (in-container)
+DL_HOST="/mnt/cluster/Media/slskd_downloads"            # staging, as seen from the host
+DL_CTR="/downloads"                                     # same dir, as seen inside soulbeet
+BEETS_CFG="/config/config.yaml"                         # soulbeet's beets config (in-container)
+LIB_DB="/data/beets-libraries/music/.beets_library.db"  # soulbeet's canonical library db (in-container)
+TARGET="/music"                                         # library destination (in-container)
+SETTLE_MINUTES=15                                       # skip folders with files modified within this window
 
 if ! docker ps --format '{{.Names}}' | grep -qx soulbeet; then
   echo "soulbeet container not running; skipping sweep"
@@ -33,12 +41,17 @@ if ! flock -n 9; then
   exit 0
 fi
 
-imported=0; skipped=0; empty=0; failed=0; total=0
+imported=0; skipped=0; busy=0; empty=0; failed=0; total=0
 
 for d in "$DL_HOST"/*/; do
   [ -d "$d" ] || continue
   name=$(basename "$d")
   total=$((total + 1))
+
+  if [ -n "$(find "$d" -mmin "-$SETTLE_MINUTES" -type f 2>/dev/null | head -1)" ]; then
+    busy=$((busy + 1))
+    continue
+  fi
 
   n=$(find "$d" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \
         -o -iname '*.wav' -o -iname '*.ogg' \) 2>/dev/null | wc -l)
@@ -67,4 +80,4 @@ for d in "$DL_HOST"/*/; do
   fi
 done
 
-echo "Rescue sweep done: $imported imported, $skipped already-present, $empty empty, $failed failed (of $total folders)"
+echo "Rescue sweep done: $imported imported, $skipped already-present, $busy busy, $empty empty, $failed failed (of $total folders)"
