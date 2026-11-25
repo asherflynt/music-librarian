@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -302,6 +303,56 @@ def _truncate_bytes(src: Path, dst: Path, fraction: float = 0.33) -> None:
 def _prepend_id3v2(src: Path, dst: Path) -> None:
     # Minimal 10-byte ID3v2.3 header with 0-byte payload.
     dst.write_bytes(b"ID3\x03\x00\x00\x00\x00\x00\x00" + src.read_bytes())
+
+
+def _make_id3v1(title: str = "Squatty Roo", artist: str = "Ella Fitzgerald") -> bytes:
+    body = (
+        b"TAG"
+        + title.encode("latin-1")[:30].ljust(30, b"\x00")
+        + artist.encode("latin-1")[:30].ljust(30, b"\x00")
+        + b"Test Album".ljust(30, b"\x00")
+        + b"1993"
+        + b"Track 17".ljust(28, b"\x00")
+        + b"\x00\x11\x08"
+    )
+    assert len(body) == 128
+    return body
+
+
+def _make_id3v1_enhanced(title: str = "Extended Title") -> bytes:
+    block = b"TAG+" + title.encode("latin-1")[:60].ljust(223, b"\x00")
+    assert len(block) == 227
+    return block
+
+
+def _make_apev2_tag(
+    *,
+    items: list[tuple[str, bytes]] | None = None,
+    with_header: bool = True,
+    version: int = 2000,
+) -> bytes:
+    items = items or [("Comment", b"Test APEv2")]
+    body = bytearray()
+    for key, val in items:
+        body += struct.pack("<II", len(val), 0)
+        body += key.encode("ascii") + b"\x00" + val
+    tag_size = len(body) + 32  # items + footer (excludes optional header)
+    header_flag = 0x80000000 if (version == 2000 and with_header) else 0
+    footer = (
+        b"APETAGEX"
+        + struct.pack("<IIII", version, tag_size, len(items), header_flag)
+        + b"\x00" * 8
+    )
+    if header_flag:
+        header = (
+            b"APETAGEX"
+            + struct.pack(
+                "<IIII", version, tag_size, len(items), header_flag | 0x20000000
+            )
+            + b"\x00" * 8
+        )
+        return header + bytes(body) + footer
+    return bytes(body) + footer
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +859,82 @@ class PureLogicTests(unittest.TestCase):
             )
             self.assertEqual(removed_later, [str(old2)])
             self.assertFalse(old2.exists())
+
+    def test_detect_trailing_tag_variants_and_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = b"fLaC" + b"\x11\x22\x33\x44" * 64
+
+            plain = root / "plain.flac"
+            plain.write_bytes(base)
+            self.assertIsNone(dc.detect_trailing_tag(str(plain)))
+
+            id3 = root / "id3.flac"
+            id3.write_bytes(base + _make_id3v1())
+            self.assertEqual(dc.detect_trailing_tag(str(id3)), (len(base), "id3v1"))
+
+            id3_plus = root / "id3_plus.flac"
+            id3_plus.write_bytes(base + _make_id3v1_enhanced() + _make_id3v1())
+            self.assertEqual(
+                dc.detect_trailing_tag(str(id3_plus)), (len(base), "id3v1+")
+            )
+
+            ape_no_hdr = root / "ape_no_hdr.flac"
+            ape_no_hdr.write_bytes(base + _make_apev2_tag(with_header=False))
+            self.assertEqual(
+                dc.detect_trailing_tag(str(ape_no_hdr)), (len(base), "apev2")
+            )
+
+            ape_with_hdr = root / "ape_with_hdr.flac"
+            ape_with_hdr.write_bytes(base + _make_apev2_tag(with_header=True))
+            self.assertEqual(
+                dc.detect_trailing_tag(str(ape_with_hdr)), (len(base), "apev2")
+            )
+
+            ape1 = root / "ape1.flac"
+            ape1.write_bytes(
+                base + _make_apev2_tag(with_header=False, version=1000)
+            )
+            self.assertEqual(dc.detect_trailing_tag(str(ape1)), (len(base), "apev1"))
+
+            ape_and_id3 = root / "ape_and_id3.flac"
+            ape_and_id3.write_bytes(
+                base + _make_apev2_tag(with_header=True) + _make_id3v1()
+            )
+            self.assertEqual(
+                dc.detect_trailing_tag(str(ape_and_id3)),
+                (len(base), "apev2+id3v1"),
+            )
+
+            # Invalid APE footers must not match.
+            bad_is_hdr = root / "bad_is_hdr.flac"
+            bad_is_hdr.write_bytes(
+                base
+                + b"APETAGEX"
+                + struct.pack("<IIII", 2000, 32, 0, 0x20000000)
+                + b"\x00" * 8
+            )
+            self.assertIsNone(dc.detect_trailing_tag(str(bad_is_hdr)))
+
+            bad_reserved = root / "bad_reserved.flac"
+            bad_reserved.write_bytes(
+                base
+                + b"APETAGEX"
+                + struct.pack("<IIII", 2000, 32, 0, 0)
+                + b"\x01" * 8
+            )
+            self.assertIsNone(dc.detect_trailing_tag(str(bad_reserved)))
+
+            bad_size = root / "bad_size.flac"
+            bad_size.write_bytes(
+                base
+                + b"APETAGEX"
+                + struct.pack("<IIII", 2000, 999999, 0, 0)
+                + b"\x00" * 8
+            )
+            self.assertIsNone(dc.detect_trailing_tag(str(bad_size)))
+
+            self.assertIsNone(dc.detect_trailing_tag(str(root / "missing.flac")))
 
 
 # ---------------------------------------------------------------------------
@@ -1351,6 +1478,167 @@ class RealFFmpegTests(unittest.TestCase):
             )
             self.assertEqual(plugin.on_import_task_created(None, task), [task])
             self.assertTrue(f1.exists())
+
+    def test_flac_with_trailing_id3v1_and_apev2_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = self.good_flac.read_bytes()
+
+            cases = [
+                ("id3v1.flac", raw + _make_id3v1(), "id3v1"),
+                (
+                    "id3v1_plus.flac",
+                    raw + _make_id3v1_enhanced() + _make_id3v1(),
+                    "id3v1+",
+                ),
+                (
+                    "apev2_hdr.flac",
+                    raw + _make_apev2_tag(with_header=True),
+                    "apev2",
+                ),
+                (
+                    "apev2_no_hdr.flac",
+                    raw + _make_apev2_tag(with_header=False),
+                    "apev2",
+                ),
+                (
+                    "apev2_id3v1.flac",
+                    raw + _make_apev2_tag(with_header=True) + _make_id3v1(),
+                    "apev2+id3v1",
+                ),
+            ]
+            for name, payload, expected_tag in cases:
+                with self.subTest(case=name):
+                    p = root / name
+                    p.write_bytes(payload)
+                    res = dc.run_ffmpeg_decode(
+                        str(p), 20.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+                    )
+                    self.assertTrue(res.ok, f"{name}: {res}")
+                    self.assertEqual(res.trailing_tag, expected_tag)
+                    self.assertAlmostEqual(res.decoded_s, 20.0, delta=0.2)
+                    # Audio file on disk must never be modified.
+                    self.assertEqual(p.read_bytes(), payload)
+
+    def test_flac_with_corrupt_audio_and_trailing_id3v1_still_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "noise.flac"
+            subprocess.run(
+                [
+                    FFMPEG_BIN,
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anoisesrc=d=20:c=pink:a=0.3",
+                    "-ac",
+                    "2",
+                    "-sample_fmt",
+                    "s16",
+                    str(src),
+                ],
+                check=True,
+            )
+            raw = bytearray(src.read_bytes())
+            # Flip a single audio byte in the middle -> CRC error must still reject
+            # even when a valid 128-byte ID3v1 tag is appended.
+            raw[len(raw) // 2] ^= 0x10
+            bad = root / "flipped_with_id3v1.flac"
+            bad.write_bytes(bytes(raw) + _make_id3v1())
+            res = dc.run_ffmpeg_decode(
+                str(bad), 20.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+            )
+            self.assertFalse(res.ok)
+            self.assertEqual(res.reason, "decode_error")
+            self.assertIsNone(res.trailing_tag)
+
+            # Truncated FLAC with trailing ID3v1 must still reject.
+            trunc = root / "trunc_with_id3v1.flac"
+            trunc.write_bytes(src.read_bytes()[: len(raw) // 3] + _make_id3v1())
+            res_t = dc.run_ffmpeg_decode(
+                str(trunc), 20.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+            )
+            self.assertFalse(res_t.ok)
+            self.assertIn(res_t.reason, ("decode_error", "truncated"))
+
+    def test_flac_trailing_tag_retry_timeout_and_checker_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            f_id3 = root / "id3.flac"
+            f_id3.write_bytes(self.good_flac.read_bytes() + _make_id3v1())
+
+            # Fake ffmpeg that fails first decode (file arg) with decode_error,
+            # then hangs on the piped retry (pipe:0).
+            slow = root / "slow-retry-ffmpeg"
+            slow.write_text(
+                "#!/bin/sh\n"
+                'case "$*" in\n'
+                '  *pipe:0*) echo out_time_us=4000000; exec sleep 30 ;;\n'
+                '  *) echo "[flac @ 0x1] invalid sync code" >&2; exit 0 ;;\n'
+                "esac\n"
+            )
+            slow.chmod(0o755)
+            with mock.patch.object(dc, "compute_timeout", return_value=1.0):
+                res = dc.run_ffmpeg_decode(
+                    str(f_id3), 20.0, "FLAC", ffmpeg_bin=str(slow)
+                )
+            self.assertFalse(res.ok)
+            self.assertEqual(res.reason, "decode_timeout")
+
+            # Fake ffmpeg that fails first decode with decode_error, then exits 127
+            # on the piped retry -> must surface checker_unavailable.
+            broken = root / "broken-retry-ffmpeg"
+            broken.write_text(
+                "#!/bin/sh\n"
+                'case "$*" in\n'
+                '  *pipe:0*) echo "missing lib" >&2; exit 127 ;;\n'
+                '  *) echo "[flac @ 0x1] invalid sync code" >&2; exit 0 ;;\n'
+                "esac\n"
+            )
+            broken.chmod(0o755)
+            res2 = dc.run_ffmpeg_decode(
+                str(f_id3), 20.0, "FLAC", ffmpeg_bin=str(broken)
+            )
+            self.assertFalse(res2.ok)
+            self.assertEqual(res2.reason, "checker_unavailable")
+
+    def test_plugin_records_trailing_tag_in_checked_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = Path(tmp) / "downloads"
+            state_dir = downloads / ".decodecheck"
+            alb = downloads / "Ella Song Books"
+            alb.mkdir(parents=True)
+            f1 = alb / "100 - Squatty Roo.flac"
+            payload = self.good_flac.read_bytes() + _make_id3v1()
+            f1.write_bytes(payload)
+
+            plugin = dc.DecodeCheckPlugin()
+            plugin.config.set("state_dir", str(state_dir))
+            plugin.config.set("ffmpeg", FFMPEG_BIN)
+            task = _FakeImportTask(
+                str(alb).encode(),
+                [str(alb).encode()],
+                [_FakeItem(str(f1), length=20.0, fmt="FLAC", track=1)],
+            )
+            self.assertEqual(plugin.on_import_task_created(None, task), [task])
+            self.assertFalse((state_dir / "rejects.jsonl").exists())
+            self.assertEqual(f1.read_bytes(), payload)
+
+            checked = [
+                json.loads(ln)
+                for ln in (state_dir / "checked.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(checked), 1)
+            self.assertEqual(checked[0]["trailing_tag"], "id3v1")
+            self.assertEqual(checked[0]["trailing_tag_files"], 1)
+            self.assertEqual(
+                checked[0]["trailing_tag_details"],
+                [{"basename": "100 - Squatty Roo.flac", "kind": "id3v1"}],
+            )
 
 
 if __name__ == "__main__":

@@ -84,6 +84,24 @@ slskd download -> /downloads (staging) -> beets import (Soulbeet)
      ignores FLAC frame CRCs, and bit flips inside audio data with intact
      framing decode with no error at all (verified 2026-11-24, ffmpeg 8.0.1).
      Other formats do not get it: MP3 CRCs are optional and cannot be trusted.
+   - **FLAC trailing non-FLAC tags (ID3v1 / TAG+ / APEv1 / APEv2):** some older
+     taggers append an ID3v1 tag (`TAG` at `size - 128`, optionally preceded by
+     a 227-byte ID3v1 enhanced `TAG+` block) and/or an APEv1/APEv2 footer
+     (`APETAGEX` in the last 32 bytes, either at EOF or before an ID3v1 tag,
+     sized from the footer including its optional 32-byte header flag) after
+     the last FLAC frame. FFmpeg tries to parse those bytes as another FLAC
+     frame and fails at EOF with `invalid sync code` / `invalid frame header` /
+     `decode_frame() failed` (verified 2026-11-25 on 192 FLACs in *The Complete
+     Ella Fitzgerald Song Books*). When a FLAC's first decode fails with
+     `decode_error` and such a trailing tag is detected, the plugin streams
+     only the bytes before the trailer to a second identical ffmpeg decode via
+     `-f flac -i pipe:0` (with `-err_detect crccheck` and the same timeout /
+     `checker_unavailable` semantics, never modifying the file on disk). The
+     file is accepted only if that second decode exits 0 with no non-ignored
+     stderr and passes the truncation and `no_duration` rules; `trailing_tag`
+     (e.g. `"id3v1"`, `"id3v1+"`, `"apev2"`, `"apev2+id3v1"`) is recorded on
+     the accepted `checked.jsonl` line. Any mid-file corruption, CRC error, or
+     truncation still rejects.
 3. **Truncation:** if the header length is over 15 s and decoded <
    header - max(5 s, 5%), the reason is `truncated`.
 4. **No duration:** if the header length is 0 or missing for a lossless file,

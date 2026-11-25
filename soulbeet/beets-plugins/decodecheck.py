@@ -26,7 +26,9 @@ import os
 import re
 import secrets
 import shutil
+import struct
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -240,6 +242,7 @@ class CheckResult:
     decoded_s: float | None
     magic_mismatch: str | None = None
     ignored_warnings: tuple[str, ...] = ()
+    trailing_tag: str | None = None
 
 
 def _lower_priority() -> None:
@@ -549,14 +552,119 @@ CHECKER_FAILURE_RCS = frozenset({126, 127})
 CHECKER_FAILURE_SIGNALS = frozenset({-9, -15})
 
 
+# Trailing non-FLAC metadata tag constants (ID3v1, ID3v1 enhanced, APEv1/v2).
+ID3V1_SIZE = 128
+ID3V1_ENHANCED_SIZE = 227
+APE_FOOTER_SIZE = 32
+APE_PREAMBLE = b"APETAGEX"
+APE_FLAG_CONTAINS_HEADER = 0x80000000
+APE_FLAG_IS_HEADER = 0x20000000
+PIPE_CHUNK_BYTES = 65536
+
+
+def is_flac(item_format: str | None, path: str) -> bool:
+    """Return True if the file is a FLAC audio file."""
+    fmt = (item_format or "").strip().upper()
+    return fmt == "FLAC" or os.path.splitext(path)[1].lower() == ".flac"
+
+
+def _detect_id3v1_at(fh: Any, end: int) -> tuple[int, str] | None:
+    """Detect an ID3v1 tag (and optional preceding TAG+ enhanced block) ending at ``end``."""
+    if end < ID3V1_SIZE:
+        return None
+    fh.seek(end - ID3V1_SIZE)
+    if fh.read(3) != b"TAG":
+        return None
+    new_end = end - ID3V1_SIZE
+    if new_end >= ID3V1_ENHANCED_SIZE:
+        fh.seek(new_end - ID3V1_ENHANCED_SIZE)
+        if fh.read(4) == b"TAG+":
+            return new_end - ID3V1_ENHANCED_SIZE, "id3v1+"
+    return new_end, "id3v1"
+
+
+def _detect_ape_at(fh: Any, end: int) -> tuple[int, str] | None:
+    """Detect an APEv1/APEv2 tag footer ending at ``end``."""
+    if end < APE_FOOTER_SIZE:
+        return None
+    fh.seek(end - APE_FOOTER_SIZE)
+    footer = fh.read(APE_FOOTER_SIZE)
+    if len(footer) != APE_FOOTER_SIZE or footer[:8] != APE_PREAMBLE:
+        return None
+    version, tag_size, _item_count, flags = struct.unpack("<IIII", footer[8:24])
+    reserved = footer[24:32]
+    if version not in (1000, 2000):
+        return None
+    if tag_size < APE_FOOTER_SIZE:
+        return None
+    if flags & APE_FLAG_IS_HEADER:
+        return None
+    if reserved != b"\x00" * 8:
+        return None
+    has_header = version == 2000 and bool(flags & APE_FLAG_CONTAINS_HEADER)
+    total_size = tag_size + (APE_FOOTER_SIZE if has_header else 0)
+    new_end = end - total_size
+    if new_end <= 0:
+        return None
+    label = "apev2" if version == 2000 else "apev1"
+    return new_end, label
+
+
+def detect_trailing_tag(path: str) -> tuple[int, str] | None:
+    """Detect non-FLAC trailing metadata tags (ID3v1 / TAG+ / APEv1 / APEv2).
+
+    Returns ``(audio_end_offset, tag_label)`` where ``audio_end_offset`` is the
+    byte length of the file before the trailing tag(s), or ``None`` if no valid
+    trailing tag is found (or the file cannot be read). Never modifies the file.
+    """
+    try:
+        with open(path, "rb") as fh:
+            file_size = os.fstat(fh.fileno()).st_size
+            if file_size <= APE_FOOTER_SIZE:
+                return None
+
+            end = file_size
+            tags_rev: list[str] = []
+            seen_id3v1 = False
+            seen_ape = False
+
+            while end > 0:
+                if not seen_id3v1:
+                    hit = _detect_id3v1_at(fh, end)
+                    if hit is not None:
+                        end, label = hit
+                        tags_rev.append(label)
+                        seen_id3v1 = True
+                        continue
+                if not seen_ape:
+                    hit = _detect_ape_at(fh, end)
+                    if hit is not None:
+                        end, label = hit
+                        tags_rev.append(label)
+                        seen_ape = True
+                        continue
+                break
+    except OSError:
+        return None
+
+    if not tags_rev or end < 4:
+        return None
+    return end, "+".join(reversed(tags_rev))
+
+
 def build_ffmpeg_cmd(
-    ffmpeg_bin: str, path: str, item_format: str | None = None
+    ffmpeg_bin: str,
+    path: str,
+    item_format: str | None = None,
+    *,
+    input_format: str | None = None,
 ) -> list[str]:
     """The decode command for one file (see docs/decode-gate.md)."""
     cmd = [ffmpeg_bin, "-nostdin", "-v", "error", "-progress", "pipe:1"]
-    fmt = (item_format or "").strip().upper()
-    if fmt == "FLAC" or os.path.splitext(path)[1].lower() == ".flac":
+    if is_flac(item_format, path):
         cmd += ["-err_detect", "crccheck"]
+    if input_format:
+        cmd += ["-f", input_format]
     cmd += ["-i", path, "-vn", "-sn", "-dn", "-f", "null", "-"]
     return cmd
 
@@ -591,6 +699,165 @@ def ffmpeg_self_test(ffmpeg_bin: str = "ffmpeg") -> str | None:
     return None
 
 
+def _run_ffmpeg_piped_prefix(
+    path: str,
+    limit_bytes: int,
+    header_s: float | None,
+    item_format: str | None,
+    *,
+    ffmpeg_bin: str,
+    timeout: float,
+    min_check_s: float,
+    trunc_abs_s: float,
+    trunc_frac: float,
+) -> CheckResult | None:
+    """Stream the first ``limit_bytes`` of ``path`` to ffmpeg on stdin.
+
+    Returns ``None`` if the source file could not be read (caller falls back to
+    the first decode result so vanished-file detection still triggers). Keeps
+    the same timeout and ``checker_unavailable`` semantics as direct decode.
+    """
+    h_rounded = _round_seconds(header_s)
+    cmd = build_ffmpeg_cmd(
+        ffmpeg_bin, "pipe:0", item_format or "FLAC", input_format="flac"
+    )
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=_lower_priority,
+        )
+    except OSError as exc:
+        return CheckResult(
+            ok=False,
+            reason="checker_unavailable",
+            detail=f"cannot execute {ffmpeg_bin}: {exc}"[:MAX_DETAIL_CHARS],
+            header_s=h_rounded,
+            decoded_s=None,
+        )
+
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    stop_event = threading.Event()
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    read_error: list[OSError] = []
+
+    def _feed() -> None:
+        try:
+            with open(path, "rb") as fh:
+                remaining = limit_bytes
+                while remaining > 0 and not stop_event.is_set():
+                    chunk = fh.read(min(PIPE_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        break
+                    try:
+                        proc.stdin.write(chunk)
+                    except (BrokenPipeError, OSError):
+                        break
+                    remaining -= len(chunk)
+        except OSError as exc:
+            read_error.append(exc)
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    def _drain(stream: Any, buf: list[bytes]) -> None:
+        try:
+            while True:
+                data = stream.read(PIPE_CHUNK_BYTES)
+                if not data:
+                    break
+                buf.append(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    t_feed = threading.Thread(target=_feed, daemon=True)
+    t_out = threading.Thread(
+        target=_drain, args=(proc.stdout, stdout_chunks), daemon=True
+    )
+    t_err = threading.Thread(
+        target=_drain, args=(proc.stderr, stderr_chunks), daemon=True
+    )
+    t_feed.start()
+    t_out.start()
+    t_err.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stop_event.set()
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.SubprocessError:
+            pass
+        t_feed.join(timeout=5)
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+        partial_stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        partial_decoded = parse_progress_out_time_s(partial_stdout)
+        return CheckResult(
+            ok=False,
+            reason="decode_timeout",
+            detail=f"ffmpeg timed out after {timeout:.0f}s"[:MAX_DETAIL_CHARS],
+            header_s=h_rounded,
+            decoded_s=_round_seconds(partial_decoded),
+        )
+
+    stop_event.set()
+    t_feed.join(timeout=5)
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+
+    stdout_str = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+    stderr_str = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+
+    rc = proc.returncode
+    if rc in CHECKER_FAILURE_RCS or rc in CHECKER_FAILURE_SIGNALS:
+        err = stderr_str.strip()
+        return CheckResult(
+            ok=False,
+            reason="checker_unavailable",
+            detail=(
+                f"{ffmpeg_bin} exited with status {rc}"
+                + (f": {err}" if err else "")
+            )[:MAX_DETAIL_CHARS],
+            header_s=h_rounded,
+            decoded_s=None,
+        )
+
+    if read_error:
+        return None
+
+    return evaluate_decode(
+        path=path,
+        header_s=header_s,
+        item_format=item_format,
+        returncode=rc,
+        stdout=stdout_str,
+        stderr=stderr_str,
+        min_check_s=min_check_s,
+        trunc_abs_s=trunc_abs_s,
+        trunc_frac=trunc_frac,
+    )
+
+
 def run_ffmpeg_decode(
     path: str,
     header_s: float | None,
@@ -610,6 +877,10 @@ def run_ffmpeg_decode(
     FLAC gets ``-err_detect crccheck``: without it ffmpeg ignores FLAC frame
     CRCs, so bit flips inside audio data with intact framing decode "clean".
     It is not used for other formats (MP3 CRCs are optional and unreliable).
+
+    If a FLAC fails with ``decode_error`` and has a trailing non-FLAC metadata
+    tag (ID3v1, ID3v1 enhanced ``TAG+``, or APEv1/APEv2 footer), re-runs the
+    identical check streaming only the bytes before the trailer to ``pipe:0``.
     """
     timeout = compute_timeout(header_s)
     h_rounded = _round_seconds(header_s)
@@ -656,7 +927,7 @@ def run_ffmpeg_decode(
             decoded_s=None,
         )
 
-    return evaluate_decode(
+    res = evaluate_decode(
         path=path,
         header_s=header_s,
         item_format=item_format,
@@ -667,6 +938,28 @@ def run_ffmpeg_decode(
         trunc_abs_s=trunc_abs_s,
         trunc_frac=trunc_frac,
     )
+
+    if not res.ok and res.reason == "decode_error" and is_flac(item_format, path):
+        trailer = detect_trailing_tag(path)
+        if trailer is not None:
+            audio_end, tag_kind = trailer
+            retry = _run_ffmpeg_piped_prefix(
+                path=path,
+                limit_bytes=audio_end,
+                header_s=header_s,
+                item_format=item_format,
+                ffmpeg_bin=ffmpeg_bin,
+                timeout=timeout,
+                min_check_s=min_check_s,
+                trunc_abs_s=trunc_abs_s,
+                trunc_frac=trunc_frac,
+            )
+            if retry is not None:
+                if retry.ok:
+                    retry.trailing_tag = tag_kind
+                return retry
+
+    return res
 
 
 def make_task_id(now: datetime.datetime | None = None) -> str:
@@ -1269,6 +1562,7 @@ class DecodeCheckPlugin(BeetsPlugin):
         magic_mismatches: list[dict[str, str]] = []
         ignored_image_warnings: list[dict[str, str]] = []
         ignored_metadata_warnings: list[dict[str, str]] = []
+        trailing_tags: list[dict[str, str]] = []
 
         targets_to_check = targets
         if self._self_tested_bin != ffmpeg_bin:
@@ -1335,6 +1629,13 @@ class DecodeCheckPlugin(BeetsPlugin):
                         {
                             "basename": os.path.basename(staging_path),
                             "kind": res.magic_mismatch,
+                        }
+                    )
+                if res.trailing_tag:
+                    trailing_tags.append(
+                        {
+                            "basename": os.path.basename(staging_path),
+                            "kind": res.trailing_tag,
                         }
                     )
                 if res.ignored_warnings:
@@ -1444,6 +1745,20 @@ class DecodeCheckPlugin(BeetsPlugin):
                 len(ignored_metadata_warnings),
                 ignored_metadata_warnings[0]["warning"],
             )
+        trailing_tag_summary: str | None = None
+        if trailing_tags:
+            unique_kinds = list(dict.fromkeys(t["kind"] for t in trailing_tags))
+            trailing_tag_summary = (
+                unique_kinds[0]
+                if len(unique_kinds) == 1
+                else ",".join(unique_kinds)
+            )
+            self._log.info(
+                "accepted task {} with trailing tag(s) on {} file(s): {}",
+                task_id,
+                len(trailing_tags),
+                trailing_tag_summary,
+            )
 
         checked_rec: dict[str, Any] = {
             "v": CONTRACT_VERSION,
@@ -1465,6 +1780,10 @@ class DecodeCheckPlugin(BeetsPlugin):
             checked_rec["ignored_metadata_warning_details"] = (
                 ignored_metadata_warnings
             )
+        if trailing_tags and trailing_tag_summary is not None:
+            checked_rec["trailing_tag"] = trailing_tag_summary
+            checked_rec["trailing_tag_files"] = len(trailing_tags)
+            checked_rec["trailing_tag_details"] = trailing_tags
 
         try:
             checked_path = os.path.join(state_dir, "checked.jsonl")
