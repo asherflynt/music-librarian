@@ -2168,6 +2168,298 @@ class RealFFmpegTests(unittest.TestCase):
             self.assertFalse((state_dir / "rejects.jsonl").exists())
             self.assertFalse((state_dir / "quarantine").exists())
 
+    def test_compute_tail_window_boundaries(self):
+        # Long track: capped at tail_window_s (1.0s).
+        self.assertAlmostEqual(dc.compute_tail_window(200.0), 1.0)
+        self.assertAlmostEqual(dc.compute_tail_window(100.0), 1.0)
+        # Short track: 1% < 1.0s -> honours 1% window.
+        self.assertAlmostEqual(dc.compute_tail_window(50.0), 0.5)
+        self.assertAlmostEqual(dc.compute_tail_window(20.0), 0.2)
+        # Missing/zero/negative duration or disabled window -> None.
+        self.assertIsNone(dc.compute_tail_window(None))
+        self.assertIsNone(dc.compute_tail_window(0.0))
+        self.assertIsNone(dc.compute_tail_window(-5.0))
+        self.assertIsNone(dc.compute_tail_window(200.0, tail_window_s=0.0))
+        self.assertIsNone(dc.compute_tail_window(200.0, tail_window_frac=0.0))
+        self.assertIsNone(
+            dc.compute_tail_window(0.5, tail_window_s=1.0, tail_window_frac=1.0)
+        )
+
+    def test_flac_tail_damage_last_frame_accepted_and_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = Path(tmp) / "downloads"
+            state_dir = downloads / ".decodecheck"
+            alb = downloads / "Tail Damage Album"
+            alb.mkdir(parents=True)
+            src = Path(tmp) / "noise20.flac"
+            subprocess.run(
+                [
+                    FFMPEG_BIN,
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anoisesrc=d=20:c=pink:a=0.3",
+                    "-ac",
+                    "2",
+                    "-sample_fmt",
+                    "s16",
+                    str(src),
+                ],
+                check=True,
+            )
+            # Corrupt only the very end of the FLAC (inside the last 0.2s = 1% window).
+            raw = bytearray(src.read_bytes())
+            raw[-256:] = b"\xff" * 256
+            f1 = alb / "01 Tail Corrupt.flac"
+            f1.write_bytes(raw)
+
+            # Confirm raw check without tail tolerance rejects as decode_error.
+            r_strict = dc.run_ffmpeg_decode(
+                str(f1), 20.0, "FLAC", ffmpeg_bin=FFMPEG_BIN, tail_tolerance=False
+            )
+            self.assertFalse(r_strict.ok)
+            self.assertEqual(r_strict.reason, "decode_error")
+
+            # With default tail tolerance -> accepted with tail_damage metadata.
+            r_tol = dc.run_ffmpeg_decode(
+                str(f1), 20.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+            )
+            self.assertTrue(r_tol.ok, r_tol)
+            self.assertTrue(r_tol.tail_damage)
+            self.assertAlmostEqual(r_tol.tail_window_s, 0.2, places=3)
+            self.assertTrue(r_tol.tail_error_detail)
+            self.assertLessEqual(len(r_tol.tail_error_detail), dc.MAX_DETAIL_CHARS)
+
+            # Full plugin run: accepted, logs one info line per tail-damaged file,
+            # writes tail_damage=True and tail_damage_files=[...] to checked.jsonl.
+            plugin = dc.DecodeCheckPlugin()
+            plugin.config.set("state_dir", str(state_dir))
+            plugin.config.set("ffmpeg", FFMPEG_BIN)
+            task = _FakeImportTask(
+                str(alb).encode(),
+                [str(alb).encode()],
+                [_FakeItem(str(f1), length=20.0, fmt="FLAC", track=1)],
+            )
+            self.assertEqual(plugin.on_import_task_created(None, task), [task])
+            self.assertFalse((state_dir / "rejects.jsonl").exists())
+
+            checked = [
+                json.loads(ln)
+                for ln in (state_dir / "checked.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(checked), 1)
+            self.assertIs(checked[0]["tail_damage"], True)
+            self.assertEqual(len(checked[0]["tail_damage_files"]), 1)
+            entry = checked[0]["tail_damage_files"][0]
+            self.assertEqual(entry["basename"], "01 Tail Corrupt.flac")
+            self.assertAlmostEqual(entry["window_s"], 0.2, places=3)
+            self.assertTrue(entry["detail"])
+            self.assertLessEqual(len(entry["detail"]), dc.MAX_DETAIL_CHARS)
+
+            tail_logs = [
+                msg
+                for lvl, msg in plugin._log.records
+                if lvl == "info" and "tail damage" in msg
+            ]
+            self.assertEqual(len(tail_logs), 1)
+            self.assertIn("01 Tail Corrupt.flac", tail_logs[0])
+
+    def test_flac_midfile_corruption_and_outside_short_window_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "noise20.flac"
+            subprocess.run(
+                [
+                    FFMPEG_BIN,
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anoisesrc=d=20:c=pink:a=0.3",
+                    "-ac",
+                    "2",
+                    "-sample_fmt",
+                    "s16",
+                    str(src),
+                ],
+                check=True,
+            )
+            raw = src.read_bytes()
+
+            # 1) Corruption at 50% (single-bit CRC flip) -> rejected.
+            mid = bytearray(raw)
+            mid[len(mid) // 2] ^= 0x10
+            p_mid = root / "mid50.flac"
+            p_mid.write_bytes(mid)
+            res_mid = dc.run_ffmpeg_decode(
+                str(p_mid), 20.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+            )
+            self.assertFalse(res_mid.ok, res_mid)
+            self.assertEqual(res_mid.reason, "decode_error")
+            self.assertFalse(res_mid.tail_damage)
+
+            # 2) Short 20s track: W = min(1.0, 20 * 0.01) = 0.20s (1%).
+            #    Damage at ~1.5% from end (19.7s, which is inside 1.0s but outside 1%)
+            #    must be caught by the prefix decode and rejected.
+            early = bytearray(raw)
+            off = int(len(raw) * 0.985)
+            early[off : off + 64] = b"\xff" * 64
+            p_early = root / "early15pct.flac"
+            p_early.write_bytes(early)
+            res_early = dc.run_ffmpeg_decode(
+                str(p_early), 20.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+            )
+            self.assertFalse(res_early.ok, res_early)
+            self.assertEqual(res_early.reason, "decode_error")
+            self.assertFalse(res_early.tail_damage)
+
+            # 3) Truncated FLAC (50% of bytes) -> still rejected (never tail-tolerated).
+            p_trunc = root / "trunc.flac"
+            p_trunc.write_bytes(raw[: len(raw) // 2])
+            res_trunc = dc.run_ffmpeg_decode(
+                str(p_trunc), 20.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+            )
+            self.assertFalse(res_trunc.ok, res_trunc)
+            self.assertIn(res_trunc.reason, ("truncated", "decode_error"))
+            self.assertFalse(res_trunc.tail_damage)
+
+    @unittest.skipUnless(HAS_MP3_ENCODER, "ffmpeg libmp3lame encoder not available")
+    def test_mp3_with_trailing_nul_padding_accepted_with_tail_damage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "epiphany.mp3"
+            _gen_mp3(src, duration_s=20)
+            # Append 2 KB of trailing garbage/NUL padding (matching real Epiphany case).
+            # Pure NULs or non-sync padding at EOF: test with NULs first; if ffmpeg 8
+            # ignores pure NULs on this build, add a malformed sync byte inside the NUL
+            # pad so the full decode actually triggers a decode_error to exercise the rule.
+            payload = src.read_bytes() + (b"\x00" * 2048)
+            p = root / "01 - Epiphany.mp3"
+            p.write_bytes(payload)
+            strict = dc.run_ffmpeg_decode(
+                str(p), 20.0, "MP3", ffmpeg_bin=FFMPEG_BIN, tail_tolerance=False
+            )
+            if strict.ok:
+                # Some lame/ffmpeg combinations skip pure NULs; inject a broken frame
+                # header inside the trailing 2 KB NUL block (same "Error submitting packet
+                # to decoder" / "Header missing" at EOF).
+                payload = src.read_bytes() + b"\xff\xfb\x90\x00" + (b"\x00" * 2044)
+                p.write_bytes(payload)
+                strict = dc.run_ffmpeg_decode(
+                    str(p), 20.0, "MP3", ffmpeg_bin=FFMPEG_BIN, tail_tolerance=False
+                )
+            self.assertFalse(strict.ok, "expected full decode to fail on trailing NUL/junk")
+            self.assertEqual(strict.reason, "decode_error")
+
+            res = dc.run_ffmpeg_decode(str(p), 20.0, "MP3", ffmpeg_bin=FFMPEG_BIN)
+            self.assertTrue(res.ok, res)
+            self.assertTrue(res.tail_damage)
+            self.assertAlmostEqual(res.tail_window_s, 0.2, places=3)
+            self.assertTrue(res.tail_error_detail)
+            # Never modifies the file on disk.
+            self.assertEqual(p.read_bytes(), payload)
+
+    def test_tail_tolerance_never_overrides_truncated_nodur_or_unknown_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Clean-EOF truncated FLAC -> reason=truncated; tail tolerance must never run.
+            short_flac = root / "short10.flac"
+            _gen_flac(short_flac, duration_s=10)
+            with mock.patch.object(
+                dc, "_run_ffmpeg_tail_tolerance", wraps=dc._run_ffmpeg_tail_tolerance
+            ) as spy:
+                res_t = dc.run_ffmpeg_decode(
+                    str(short_flac), 25.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+                )
+                self.assertFalse(res_t.ok)
+                self.assertEqual(res_t.reason, "truncated")
+                spy.assert_not_called()
+
+                # Zero-duration lossless -> reason=no_duration; tail tolerance must never run.
+                res_nd = dc.run_ffmpeg_decode(
+                    str(self.nodur_flac), 0.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+                )
+                self.assertFalse(res_nd.ok)
+                self.assertEqual(res_nd.reason, "no_duration")
+                spy.assert_not_called()
+
+            # Unknown/zero header_s with decode_error -> rejected (requires header_s > 0).
+            res_unk = dc.run_ffmpeg_decode(
+                str(self.corrupt_flac), None, "FLAC", ffmpeg_bin=FFMPEG_BIN
+            )
+            self.assertFalse(res_unk.ok)
+            self.assertEqual(res_unk.reason, "decode_error")
+            self.assertFalse(res_unk.tail_damage)
+
+    def test_tail_tolerance_handles_timeout_checker_unavailable_and_backwards_full_dts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            f = root / "track.flac"
+            f.write_bytes(self.good_flac.read_bytes())
+
+            # Fake ffmpeg: full decode fails with decode_error and reports a bogus
+            # backwards out_time_us (83%, as seen on corrupt-tail FLACs), while
+            # prefix decode (-f matroska) succeeds cleanly to 99.5%.
+            backwards_bin = root / "fake-backwards-ffmpeg"
+            backwards_bin.write_text(
+                "#!/bin/sh\n"
+                'case "$*" in\n'
+                '  *"-c:a copy"*) exit 0 ;;\n'
+                '  *"pipe:0"*) echo "out_time_us=199000000"; echo "progress=end"; exit 0 ;;\n'
+                '  *) echo "out_time_us=166000000"; echo "[flac @ 0x1] invalid residual" >&2; exit 0 ;;\n'
+                "esac\n"
+            )
+            backwards_bin.chmod(0o755)
+            res = dc.run_ffmpeg_decode(
+                str(f), 200.0, "FLAC", ffmpeg_bin=str(backwards_bin)
+            )
+            self.assertTrue(res.ok, res)
+            self.assertTrue(res.tail_damage)
+            self.assertAlmostEqual(res.tail_window_s, 1.0, places=3)
+            self.assertEqual(res.decoded_s, 199.0)
+
+            # Fake ffmpeg that exits 127 during prefix decode -> checker_unavailable.
+            broken_bin = root / "fake-broken-tail-ffmpeg"
+            broken_bin.write_text(
+                "#!/bin/sh\n"
+                'case "$*" in\n'
+                '  *"-c:a copy"*) echo "missing lib" >&2; exit 127 ;;\n'
+                '  *"pipe:0"*) exit 0 ;;\n'
+                '  *) echo "[flac @ 0x1] invalid sync code" >&2; exit 0 ;;\n'
+                "esac\n"
+            )
+            broken_bin.chmod(0o755)
+            res2 = dc.run_ffmpeg_decode(
+                str(f), 200.0, "FLAC", ffmpeg_bin=str(broken_bin)
+            )
+            self.assertFalse(res2.ok)
+            self.assertEqual(res2.reason, "checker_unavailable")
+
+            # Fake ffmpeg that hangs during prefix decode -> decode_timeout.
+            slow_bin = root / "fake-slow-tail-ffmpeg"
+            slow_bin.write_text(
+                "#!/bin/sh\n"
+                'case "$*" in\n'
+                '  *"-c:a copy"*) exec sleep 30 ;;\n'
+                '  *"pipe:0"*) echo "out_time_us=5000000"; exec sleep 30 ;;\n'
+                '  *) echo "[flac @ 0x1] invalid sync code" >&2; exit 0 ;;\n'
+                "esac\n"
+            )
+            slow_bin.chmod(0o755)
+            with mock.patch.object(dc, "compute_timeout", return_value=1.0):
+                res3 = dc.run_ffmpeg_decode(
+                    str(f), 200.0, "FLAC", ffmpeg_bin=str(slow_bin)
+                )
+            self.assertFalse(res3.ok)
+            self.assertEqual(res3.reason, "decode_timeout")
+
 
 if __name__ == "__main__":
     unittest.main()

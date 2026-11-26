@@ -49,5 +49,13 @@ To bypass the decode gate without rolling back, set `decodecheck: {enabled: no}`
 All state lives in `/mnt/cluster/Media/slskd_downloads/.decodecheck/` (mounted inside Soulbeet as `/downloads/.decodecheck/` and read-only inside librarian as `/cluster/Media/slskd_downloads/.decodecheck/`):
 
 - `rejects.jsonl` — append-only log, one JSON line per rejected audio file (schema in [`docs/decode-gate.md`](../docs/decode-gate.md)).
-- `checked.jsonl` — append-only log, one compact summary line per accepted task (including cosmetic magic mismatches).
+- `checked.jsonl` — append-only log, one compact summary line per accepted task (including cosmetic magic mismatches, ignored image/metadata warnings, peeled trailing tags, and tolerated tail-only damage via `tail_damage` / `tail_damage_files`).
 - `quarantine/<YYYY-MM-DD>/<task_id>/<relative path>` — all files (audio and non-audio) moved out of staging for each rejected task. Dated folders older than `quarantine_days` (default `14`) are pruned automatically at most once per hour.
+
+### Key `decodecheck:` Config Options
+
+Configured in [`beets-config.yaml.template`](beets-config.yaml.template) (all defaults also live in `decodecheck.py`):
+
+- `enabled` (`yes`), `state_dir` (`/downloads/.decodecheck`), `quarantine_days` (`14`), `ffmpeg` (`ffmpeg`)
+- `min_check_s` (`15`), `trunc_abs_s` (`5`), `trunc_frac` (`0.05`) — truncation thresholds
+- `tail_tolerance` (`yes`), `tail_window_s` (`1.0`), `tail_window_frac` (`0.01`), `min_complete_frac` (`0.99`) — last-second tail-damage tolerance for `decode_error` files that decode cleanly up to `header - min(tail_window_s, header * tail_window_frac)` and are at least `min_complete_frac` complete (details in [`docs/decode-gate.md`](../docs/decode-gate.md))

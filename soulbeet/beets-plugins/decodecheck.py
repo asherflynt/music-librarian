@@ -249,6 +249,9 @@ class CheckResult:
     magic_mismatch: str | None = None
     ignored_warnings: tuple[str, ...] = ()
     trailing_tag: str | None = None
+    tail_damage: bool = False
+    tail_window_s: float | None = None
+    tail_error_detail: str | None = None
 
 
 def _lower_priority() -> None:
@@ -962,6 +965,258 @@ def _run_ffmpeg_piped_prefix(
     )
 
 
+def compute_tail_window(
+    header_s: float | None,
+    *,
+    tail_window_s: float = 1.0,
+    tail_window_frac: float = 0.01,
+) -> float | None:
+    """Return the tolerated tail window ``W = min(tail_window_s, header_s * tail_window_frac)``.
+
+    Returns ``None`` if header duration is unknown/non-positive or the window is
+    non-positive or covers the entire track.
+    """
+    if header_s is None or header_s <= 0.0:
+        return None
+    if tail_window_s <= 0.0 or tail_window_frac <= 0.0:
+        return None
+    window = min(float(tail_window_s), float(header_s) * float(tail_window_frac))
+    if window <= 0.0 or window >= float(header_s):
+        return None
+    return window
+
+
+def _run_ffmpeg_tail_tolerance(
+    path: str,
+    header_s: float | None,
+    item_format: str | None,
+    *,
+    full_result: CheckResult,
+    full_decoded_raw: float | None,
+    ffmpeg_bin: str,
+    timeout: float,
+    min_check_s: float,
+    trunc_abs_s: float,
+    trunc_frac: float,
+    tail_window_s: float,
+    tail_window_frac: float,
+    min_complete_frac: float,
+    check_magic: bool = True,
+) -> CheckResult | None:
+    """Re-decode the clean prefix ``[0, header_s - W)`` to test tail-only damage.
+
+    Uses a deterministic two-stage ffmpeg pipeline: stage 1 stream-copies
+    packets with ``-t (header_s - W)`` into Matroska on stdout, and stage 2
+    decodes that exact packet prefix to null with the same flags (including
+    ``-err_detect crccheck`` for FLAC). Separating packet cutoff from decoding
+    avoids FFmpeg 7+/8+'s asynchronous demuxer/decoder read-ahead race where a
+    single-process ``-t`` decode can still pull broken EOF frames past ``-t``.
+
+    Returns an accepted :class:`CheckResult` with ``tail_damage=True`` if the
+    prefix decodes with exit 0 and no non-ignored stderr, reaches the prefix
+    target, and satisfies both ``min_complete_frac`` and the truncation rule;
+    returns a ``decode_timeout`` / ``checker_unavailable`` result on checker
+    failure; otherwise returns ``None`` so the caller keeps ``full_result``.
+    """
+    window_s = compute_tail_window(
+        header_s,
+        tail_window_s=tail_window_s,
+        tail_window_frac=tail_window_frac,
+    )
+    if window_s is None:
+        return None
+
+    h_val = float(header_s)  # type: ignore[arg-type]
+    h_rounded = _round_seconds(h_val)
+    prefix_s = h_val - window_s
+
+    cmd_copy = [
+        ffmpeg_bin,
+        "-nostdin",
+        "-v",
+        "error",
+        "-i",
+        path,
+        "-t",
+        f"{prefix_s:.6f}",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-c:a",
+        "copy",
+        "-f",
+        "matroska",
+        "pipe:1",
+    ]
+    fmt_for_cmd = "FLAC" if is_flac(item_format, path) else item_format
+    cmd_decode = build_ffmpeg_cmd(
+        ffmpeg_bin, "pipe:0", fmt_for_cmd, input_format="matroska"
+    )
+
+    p1: subprocess.Popen[bytes] | None = None
+    p2: subprocess.Popen[bytes] | None = None
+    try:
+        p1 = subprocess.Popen(
+            cmd_copy,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=_lower_priority,
+        )
+        p2 = subprocess.Popen(
+            cmd_decode,
+            stdin=p1.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=_lower_priority,
+        )
+    except OSError as exc:
+        if p1 is not None:
+            try:
+                p1.kill()
+                p1.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return CheckResult(
+            ok=False,
+            reason="checker_unavailable",
+            detail=f"cannot execute {ffmpeg_bin}: {exc}"[:MAX_DETAIL_CHARS],
+            header_s=h_rounded,
+            decoded_s=None,
+        )
+
+    assert p1.stdout is not None and p1.stderr is not None
+    assert p2.stdout is not None and p2.stderr is not None
+    # Close parent's reference to the pipe write/read end so p1 sees SIGPIPE if p2 exits early.
+    p1.stdout.close()
+
+    p1_err_chunks: list[bytes] = []
+    p2_out_chunks: list[bytes] = []
+    p2_err_chunks: list[bytes] = []
+
+    def _drain(stream: Any, buf: list[bytes]) -> None:
+        try:
+            while True:
+                data = stream.read(PIPE_CHUNK_BYTES)
+                if not data:
+                    break
+                buf.append(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    t_p1_err = threading.Thread(
+        target=_drain, args=(p1.stderr, p1_err_chunks), daemon=True
+    )
+    t_p2_out = threading.Thread(
+        target=_drain, args=(p2.stdout, p2_out_chunks), daemon=True
+    )
+    t_p2_err = threading.Thread(
+        target=_drain, args=(p2.stderr, p2_err_chunks), daemon=True
+    )
+    t_p1_err.start()
+    t_p2_out.start()
+    t_p2_err.start()
+
+    deadline = time.monotonic() + timeout
+    try:
+        p2.wait(timeout=max(0.1, deadline - time.monotonic()))
+        p1.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        for proc in (p1, p2):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        for proc in (p1, p2):
+            try:
+                proc.wait(timeout=5)
+            except subprocess.SubprocessError:
+                pass
+        t_p1_err.join(timeout=5)
+        t_p2_out.join(timeout=5)
+        t_p2_err.join(timeout=5)
+        partial_stdout = b"".join(p2_out_chunks).decode("utf-8", errors="replace")
+        partial_decoded = parse_progress_out_time_s(partial_stdout)
+        return CheckResult(
+            ok=False,
+            reason="decode_timeout",
+            detail=f"ffmpeg timed out after {timeout:.0f}s"[:MAX_DETAIL_CHARS],
+            header_s=h_rounded,
+            decoded_s=_round_seconds(partial_decoded),
+        )
+
+    t_p1_err.join(timeout=5)
+    t_p2_out.join(timeout=5)
+    t_p2_err.join(timeout=5)
+
+    p1_err = b"".join(p1_err_chunks).decode("utf-8", errors="replace")
+    p2_out = b"".join(p2_out_chunks).decode("utf-8", errors="replace")
+    p2_err = b"".join(p2_err_chunks).decode("utf-8", errors="replace")
+
+    for rc, err_raw in ((p1.returncode, p1_err), (p2.returncode, p2_err)):
+        if rc in CHECKER_FAILURE_RCS or rc in CHECKER_FAILURE_SIGNALS:
+            err_txt = err_raw.strip()
+            return CheckResult(
+                ok=False,
+                reason="checker_unavailable",
+                detail=(
+                    f"{ffmpeg_bin} exited with status {rc}"
+                    + (f": {err_txt}" if err_txt else "")
+                )[:MAX_DETAIL_CHARS],
+                header_s=h_rounded,
+                decoded_s=None,
+            )
+
+    p1_errors, p1_ignored = filter_ffmpeg_stderr(p1_err)
+    p2_errors, p2_ignored = filter_ffmpeg_stderr(p2_err)
+    if p1.returncode != 0 or p2.returncode != 0 or p1_errors or p2_errors:
+        return None
+
+    prefix_decoded = parse_progress_out_time_s(p2_out)
+    if prefix_decoded is None:
+        return None
+
+    # Prefix decode must actually reach the prefix cutoff (within a small frame
+    # margin) so an early-EOF truncated file can never slip through.
+    if prefix_decoded < max(0.0, prefix_s - 0.25):
+        return None
+
+    # Use the maximum of full and clean-prefix decoded durations: a corrupt
+    # tail frame can occasionally cause ffmpeg's null muxer out_time_us to jump
+    # backwards on the full decode even when the prefix decoded cleanly to
+    # header_s - W >= 99% of header_s.
+    candidates = [d for d in (full_decoded_raw, prefix_decoded) if d is not None]
+    effective_decoded = max(candidates)
+
+    if effective_decoded < h_val * min_complete_frac - 1e-3:
+        return None
+
+    if h_val > min_check_s:
+        tolerance = max(trunc_abs_s, h_val * trunc_frac)
+        if effective_decoded < h_val - tolerance:
+            return None
+
+    combined_ignored = tuple(dict.fromkeys([*p1_ignored, *p2_ignored]))
+    magic = detect_magic_mismatch(path) if check_magic else None
+    return CheckResult(
+        ok=True,
+        reason=None,
+        detail="",
+        header_s=h_rounded,
+        decoded_s=_round_seconds(effective_decoded),
+        magic_mismatch=magic,
+        ignored_warnings=combined_ignored,
+        tail_damage=True,
+        tail_window_s=round(window_s, 3),
+        tail_error_detail=(full_result.detail or "")[:MAX_DETAIL_CHARS],
+    )
+
+
 def run_ffmpeg_decode(
     path: str,
     header_s: float | None,
@@ -971,6 +1226,10 @@ def run_ffmpeg_decode(
     min_check_s: float = 15.0,
     trunc_abs_s: float = 5.0,
     trunc_frac: float = 0.05,
+    tail_tolerance: bool = True,
+    tail_window_s: float = 1.0,
+    tail_window_frac: float = 0.01,
+    min_complete_frac: float = 0.99,
 ) -> CheckResult:
     """Run a full audio decode via ffmpeg and evaluate the result.
 
@@ -986,6 +1245,12 @@ def run_ffmpeg_decode(
     metadata tags (ID3v1, ID3v1 enhanced ``TAG+``, Lyrics3v1/v2, or
     APEv1/APEv2), re-runs the identical check streaming only the bytes before
     the trailer to ``pipe:0`` (with ``-f flac`` or ``-f mp3``).
+
+    If ``decode_error`` still remains and ``tail_tolerance`` is enabled with a
+    known ``header_s > 0``, re-decodes the prefix ``[0, header_s - W)`` where
+    ``W = min(tail_window_s, header_s * tail_window_frac)``; if that prefix is
+    clean and the file is at least ``min_complete_frac`` complete (and passes
+    the truncation rule), accepts the file with ``tail_damage=True``.
     """
     timeout = compute_timeout(header_s)
     h_rounded = _round_seconds(header_s)
@@ -1043,6 +1308,7 @@ def run_ffmpeg_decode(
         trunc_abs_s=trunc_abs_s,
         trunc_frac=trunc_frac,
     )
+    full_decoded_raw = parse_progress_out_time_s(proc.stdout)
 
     if not res.ok and res.reason == "decode_error":
         input_fmt = _trailing_tag_input_format(item_format, path)
@@ -1065,7 +1331,28 @@ def run_ffmpeg_decode(
                 if retry is not None:
                     if retry.ok:
                         retry.trailing_tag = tag_kind
-                    return retry
+                        return retry
+                    res = retry
+                    full_decoded_raw = retry.decoded_s
+
+    if tail_tolerance and not res.ok and res.reason == "decode_error":
+        tail_res = _run_ffmpeg_tail_tolerance(
+            path=path,
+            header_s=header_s,
+            item_format=item_format,
+            full_result=res,
+            full_decoded_raw=full_decoded_raw,
+            ffmpeg_bin=ffmpeg_bin,
+            timeout=timeout,
+            min_check_s=min_check_s,
+            trunc_abs_s=trunc_abs_s,
+            trunc_frac=trunc_frac,
+            tail_window_s=tail_window_s,
+            tail_window_frac=tail_window_frac,
+            min_complete_frac=min_complete_frac,
+        )
+        if tail_res is not None:
+            return tail_res
 
     return res
 
@@ -1602,6 +1889,10 @@ class DecodeCheckPlugin(BeetsPlugin):
                 "min_check_s": 15,
                 "trunc_abs_s": 5,
                 "trunc_frac": 0.05,
+                "tail_tolerance": True,
+                "tail_window_s": 1.0,
+                "tail_window_frac": 0.01,
+                "min_complete_frac": 0.99,
                 "enabled": True,
             }
         )
@@ -1677,6 +1968,10 @@ class DecodeCheckPlugin(BeetsPlugin):
         min_check_s = self._cfg_float("min_check_s")
         trunc_abs_s = self._cfg_float("trunc_abs_s")
         trunc_frac = self._cfg_float("trunc_frac")
+        tail_tolerance = self._cfg_bool("tail_tolerance")
+        tail_window_s = self._cfg_float("tail_window_s")
+        tail_window_frac = self._cfg_float("tail_window_frac")
+        min_complete_frac = self._cfg_float("min_complete_frac")
 
         self._maybe_prune(state_dir, quarantine_days)
 
@@ -1756,6 +2051,7 @@ class DecodeCheckPlugin(BeetsPlugin):
         ignored_image_warnings: list[dict[str, str]] = []
         ignored_metadata_warnings: list[dict[str, str]] = []
         trailing_tags: list[dict[str, str]] = []
+        tail_damage_files: list[dict[str, Any]] = []
 
         total_task_files = len(targets) + len(pre_bad_entries)
         targets_to_check = targets
@@ -1802,6 +2098,10 @@ class DecodeCheckPlugin(BeetsPlugin):
                 min_check_s=min_check_s,
                 trunc_abs_s=trunc_abs_s,
                 trunc_frac=trunc_frac,
+                tail_tolerance=tail_tolerance,
+                tail_window_s=tail_window_s,
+                tail_window_frac=tail_window_frac,
+                min_complete_frac=min_complete_frac,
             )
             if not res.ok and not os.path.lexists(staging_path):
                 # Moved away while we decoded it (another beets import of the
@@ -1831,6 +2131,31 @@ class DecodeCheckPlugin(BeetsPlugin):
                             "basename": os.path.basename(staging_path),
                             "kind": res.trailing_tag,
                         }
+                    )
+                if res.tail_damage:
+                    detail_trunc = (res.tail_error_detail or "")[:MAX_DETAIL_CHARS]
+                    win_s = (
+                        round(res.tail_window_s, 3)
+                        if res.tail_window_s is not None
+                        else None
+                    )
+                    tail_damage_files.append(
+                        {
+                            "basename": os.path.basename(staging_path),
+                            "window_s": win_s,
+                            "header_s": res.header_s,
+                            "decoded_s": res.decoded_s,
+                            "detail": detail_trunc,
+                        }
+                    )
+                    self._log.info(
+                        "decodecheck: accepted {} with tail damage within last {}s "
+                        "(header={}s, decoded={}s): {}",
+                        os.path.basename(staging_path),
+                        win_s,
+                        res.header_s,
+                        res.decoded_s,
+                        detail_trunc,
                     )
                 if res.ignored_warnings:
                     first_img = next(
@@ -1985,6 +2310,9 @@ class DecodeCheckPlugin(BeetsPlugin):
             checked_rec["trailing_tag"] = trailing_tag_summary
             checked_rec["trailing_tag_files"] = len(trailing_tags)
             checked_rec["trailing_tag_details"] = trailing_tags
+        if tail_damage_files:
+            checked_rec["tail_damage"] = True
+            checked_rec["tail_damage_files"] = tail_damage_files
 
         try:
             checked_path = os.path.join(state_dir, "checked.jsonl")

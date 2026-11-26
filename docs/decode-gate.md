@@ -115,6 +115,40 @@ slskd download -> /downloads (staging) -> beets import (Soulbeet)
      `"apev2+id3v1"`, `"lyrics3v2+id3v1"`) is recorded on the accepted
      `checked.jsonl` line. Any mid-file corruption, CRC error, or truncation
      still rejects.
+   - **Tail-only damage tolerance (last-second fallback):** applied **only**
+     after all existing fallbacks (ignored image/metadata warnings and
+     trailing-tag peeling) still fail and **only** when the failure reason is
+     `decode_error` (never for `truncated`, `no_duration`, `decode_timeout`, or
+     `checker_unavailable`), with a known `header_s > 0` from mutagen/beets:
+     - Window `W = min(tail_window_s, header_s * tail_window_frac)` (default
+       `min(1.0 s, 1% of header duration)`).
+     - Re-decodes only the prefix `[0, header_s - W)` using the same decode
+       flags (including `-err_detect crccheck` for FLAC). Implemented via a
+       two-stage ffmpeg pipe (`-t (header_s - W) -c:a copy -f matroska pipe:1`
+       into the decoder on `pipe:0`) so FFmpeg 7+/8+'s asynchronous
+       demuxer/decoder pipeline cannot race past `-t` into broken EOF frames.
+       Both stages must exit 0 with no non-ignored stderr, and the prefix must
+       decode to `header_s - W` (within a small frame margin).
+     - The effective decoded duration (`max(full_decoded_s, prefix_decoded_s)`,
+       guarding against corrupt tail frames that skew the full decode's final
+       `out_time_us` backwards) must be at least `min_complete_frac` of
+       `header_s` (default `99%`) and must also pass the existing truncation
+       rule.
+     - When both hold, the file is accepted, one `INFO` log line is emitted per
+       such file, and the accepted `checked.jsonl` line records
+       `tail_damage: true` and `tail_damage_files: [{"basename", "window_s",
+       "header_s", "decoded_s", "detail"}, ...]` (with the original error detail
+       truncated to 300 chars) so tolerated files remain auditable. Any damage
+       earlier than `header_s - W` (e.g. mid-file CRC errors) or any truncation
+       below `min_complete_frac` is caught by the prefix decode and still
+       rejected.
+     - Plugin configuration keys and defaults under `decodecheck:` in
+       `config.yaml`:
+       - `tail_tolerance: yes` (set `no` to disable)
+       - `tail_window_s: 1.0` (maximum tail window in seconds)
+       - `tail_window_frac: 0.01` (maximum tail window as a fraction of header
+         duration; short tracks use `header_s * tail_window_frac`)
+       - `min_complete_frac: 0.99` (minimum decoded fraction of header duration)
 3. **Truncation:** if the header length is over 15 s and decoded <
    header - max(5 s, 5%), the reason is `truncated`.
 4. **No duration:** if the header length is 0 or missing for a lossless file,

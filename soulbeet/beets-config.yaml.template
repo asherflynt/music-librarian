@@ -73,3 +73,7 @@ decodecheck:
   min_check_s: 15
   trunc_abs_s: 5
   trunc_frac: 0.05
+  tail_tolerance: yes
+  tail_window_s: 1.0
+  tail_window_frac: 0.01
+  min_complete_frac: 0.99
