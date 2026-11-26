@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import fcntl
+import io
 import json
 import os
 import re
@@ -557,9 +558,17 @@ CHECKER_FAILURE_RCS = frozenset({126, 127})
 CHECKER_FAILURE_SIGNALS = frozenset({-9, -15})
 
 
-# Trailing non-FLAC metadata tag constants (ID3v1, ID3v1 enhanced, APEv1/v2).
+# Trailing metadata tag constants (ID3v1, ID3v1 enhanced, Lyrics3v1/v2, APEv1/v2).
 ID3V1_SIZE = 128
 ID3V1_ENHANCED_SIZE = 227
+LYRICS3_BEGIN = b"LYRICSBEGIN"
+LYRICS3V1_END = b"LYRICSEND"
+LYRICS3V1_MAX_SIZE = 5100
+LYRICS3V1_MIN_SIZE = len(LYRICS3_BEGIN) + len(LYRICS3V1_END)  # 20
+LYRICS3V2_END = b"LYRICS200"
+LYRICS3V2_SIZE_LEN = 6
+LYRICS3V2_FOOTER_SIZE = LYRICS3V2_SIZE_LEN + len(LYRICS3V2_END)  # 15
+LYRICS3V2_MIN_SIZE = len(LYRICS3_BEGIN) + LYRICS3V2_FOOTER_SIZE  # 26
 APE_FOOTER_SIZE = 32
 APE_PREAMBLE = b"APETAGEX"
 APE_FLAG_CONTAINS_HEADER = 0x80000000
@@ -571,6 +580,21 @@ def is_flac(item_format: str | None, path: str) -> bool:
     """Return True if the file is a FLAC audio file."""
     fmt = (item_format or "").strip().upper()
     return fmt == "FLAC" or os.path.splitext(path)[1].lower() == ".flac"
+
+
+def is_mp3(item_format: str | None, path: str) -> bool:
+    """Return True if the file is an MP3 audio file."""
+    fmt = (item_format or "").strip().upper()
+    return fmt == "MP3" or os.path.splitext(path)[1].lower() == ".mp3"
+
+
+def _trailing_tag_input_format(item_format: str | None, path: str) -> str | None:
+    """Return the ffmpeg ``-f`` demuxer name for trailing-tag retry, or ``None``."""
+    if is_flac(item_format, path):
+        return "flac"
+    if is_mp3(item_format, path):
+        return "mp3"
+    return None
 
 
 def _detect_id3v1_at(fh: Any, end: int) -> tuple[int, str] | None:
@@ -586,6 +610,53 @@ def _detect_id3v1_at(fh: Any, end: int) -> tuple[int, str] | None:
         if fh.read(4) == b"TAG+":
             return new_end - ID3V1_ENHANCED_SIZE, "id3v1+"
     return new_end, "id3v1"
+
+
+def _detect_lyrics3v2_at(fh: Any, end: int) -> tuple[int, str] | None:
+    """Detect a Lyrics3v2 tag (``LYRICSBEGIN`` ... 6-digit size + ``LYRICS200``) ending at ``end``."""
+    if end < LYRICS3V2_MIN_SIZE:
+        return None
+    fh.seek(end - LYRICS3V2_FOOTER_SIZE)
+    footer = fh.read(LYRICS3V2_FOOTER_SIZE)
+    if len(footer) != LYRICS3V2_FOOTER_SIZE:
+        return None
+    if footer[LYRICS3V2_SIZE_LEN:] != LYRICS3V2_END:
+        return None
+    size_bytes = footer[:LYRICS3V2_SIZE_LEN]
+    if not size_bytes.isdigit():
+        return None
+    body_size = int(size_bytes)
+    if body_size < len(LYRICS3_BEGIN):
+        return None
+    start = end - LYRICS3V2_FOOTER_SIZE - body_size
+    if start <= 0:
+        return None
+    fh.seek(start)
+    if fh.read(len(LYRICS3_BEGIN)) != LYRICS3_BEGIN:
+        return None
+    return start, "lyrics3v2"
+
+
+def _detect_lyrics3v1_at(fh: Any, end: int) -> tuple[int, str] | None:
+    """Detect a Lyrics3v1 tag (``LYRICSBEGIN`` ... ``LYRICSEND``, max 5100 B) ending at ``end``."""
+    if end < LYRICS3V1_MIN_SIZE:
+        return None
+    fh.seek(end - len(LYRICS3V1_END))
+    if fh.read(len(LYRICS3V1_END)) != LYRICS3V1_END:
+        return None
+    window_len = min(end, LYRICS3V1_MAX_SIZE)
+    window_start = end - window_len
+    fh.seek(window_start)
+    buf = fh.read(window_len)
+    if len(buf) != window_len or not buf.endswith(LYRICS3V1_END):
+        return None
+    idx = buf.rfind(LYRICS3_BEGIN, 0, len(buf) - len(LYRICS3V1_END))
+    if idx < 0:
+        return None
+    start = window_start + idx
+    if start <= 0:
+        return None
+    return start, "lyrics3v1"
 
 
 def _detect_ape_at(fh: Any, end: int) -> tuple[int, str] | None:
@@ -615,8 +686,57 @@ def _detect_ape_at(fh: Any, end: int) -> tuple[int, str] | None:
     return new_end, label
 
 
+def _detect_trailing_tag_fh(fh: Any, file_size: int) -> tuple[int, str] | None:
+    """Repeatedly peel stacked trailing tags from seekable binary stream ``fh``."""
+    if file_size <= LYRICS3V1_MIN_SIZE:
+        return None
+
+    end = file_size
+    tags_rev: list[str] = []
+    has_id3v1 = False
+
+    while end > 0:
+        # Check strong-magic footers (APE, Lyrics3v2, Lyrics3v1) before 3-byte
+        # ID3v1 "TAG" so text containing "TAG" inside an APE/Lyrics3 body at
+        # offset -128 cannot trigger a false ID3v1 peel.
+        hit = _detect_ape_at(fh, end)
+        if hit is not None:
+            end, label = hit
+            tags_rev.append(label)
+            continue
+        hit = _detect_lyrics3v2_at(fh, end)
+        if hit is not None:
+            end, label = hit
+            tags_rev.append(label)
+            continue
+        if has_id3v1:
+            hit = _detect_lyrics3v1_at(fh, end)
+            if hit is not None:
+                end, label = hit
+                tags_rev.append(label)
+                continue
+        hit = _detect_id3v1_at(fh, end)
+        if hit is not None:
+            end, label = hit
+            tags_rev.append(label)
+            has_id3v1 = True
+            continue
+        break
+
+    if not tags_rev or end < 4:
+        return None
+    return end, "+".join(reversed(tags_rev))
+
+
+def detect_trailing_tag_bytes(
+    data: bytes | bytearray | memoryview,
+) -> tuple[int, str] | None:
+    """Detect stacked trailing tags (ID3v1 / TAG+ / Lyrics3v1 / Lyrics3v2 / APEv1/v2) in ``data``."""
+    return _detect_trailing_tag_fh(io.BytesIO(data), len(data))
+
+
 def detect_trailing_tag(path: str) -> tuple[int, str] | None:
-    """Detect non-FLAC trailing metadata tags (ID3v1 / TAG+ / APEv1 / APEv2).
+    """Detect trailing metadata tags (ID3v1 / TAG+ / Lyrics3v1 / Lyrics3v2 / APEv1/v2).
 
     Returns ``(audio_end_offset, tag_label)`` where ``audio_end_offset`` is the
     byte length of the file before the trailing tag(s), or ``None`` if no valid
@@ -625,36 +745,9 @@ def detect_trailing_tag(path: str) -> tuple[int, str] | None:
     try:
         with open(path, "rb") as fh:
             file_size = os.fstat(fh.fileno()).st_size
-            if file_size <= APE_FOOTER_SIZE:
-                return None
-
-            end = file_size
-            tags_rev: list[str] = []
-            seen_id3v1 = False
-            seen_ape = False
-
-            while end > 0:
-                if not seen_id3v1:
-                    hit = _detect_id3v1_at(fh, end)
-                    if hit is not None:
-                        end, label = hit
-                        tags_rev.append(label)
-                        seen_id3v1 = True
-                        continue
-                if not seen_ape:
-                    hit = _detect_ape_at(fh, end)
-                    if hit is not None:
-                        end, label = hit
-                        tags_rev.append(label)
-                        seen_ape = True
-                        continue
-                break
+            return _detect_trailing_tag_fh(fh, file_size)
     except OSError:
         return None
-
-    if not tags_rev or end < 4:
-        return None
-    return end, "+".join(reversed(tags_rev))
 
 
 def build_ffmpeg_cmd(
@@ -710,6 +803,7 @@ def _run_ffmpeg_piped_prefix(
     header_s: float | None,
     item_format: str | None,
     *,
+    input_format: str = "flac",
     ffmpeg_bin: str,
     timeout: float,
     min_check_s: float,
@@ -723,8 +817,13 @@ def _run_ffmpeg_piped_prefix(
     the same timeout and ``checker_unavailable`` semantics as direct decode.
     """
     h_rounded = _round_seconds(header_s)
+    fmt_for_cmd = (
+        "FLAC"
+        if input_format == "flac"
+        else (item_format or input_format.upper())
+    )
     cmd = build_ffmpeg_cmd(
-        ffmpeg_bin, "pipe:0", item_format or "FLAC", input_format="flac"
+        ffmpeg_bin, "pipe:0", fmt_for_cmd, input_format=input_format
     )
 
     try:
@@ -883,9 +982,10 @@ def run_ffmpeg_decode(
     CRCs, so bit flips inside audio data with intact framing decode "clean".
     It is not used for other formats (MP3 CRCs are optional and unreliable).
 
-    If a FLAC fails with ``decode_error`` and has a trailing non-FLAC metadata
-    tag (ID3v1, ID3v1 enhanced ``TAG+``, or APEv1/APEv2 footer), re-runs the
-    identical check streaming only the bytes before the trailer to ``pipe:0``.
+    If a FLAC or MP3 fails with ``decode_error`` and has stacked trailing
+    metadata tags (ID3v1, ID3v1 enhanced ``TAG+``, Lyrics3v1/v2, or
+    APEv1/APEv2), re-runs the identical check streaming only the bytes before
+    the trailer to ``pipe:0`` (with ``-f flac`` or ``-f mp3``).
     """
     timeout = compute_timeout(header_s)
     h_rounded = _round_seconds(header_s)
@@ -944,25 +1044,28 @@ def run_ffmpeg_decode(
         trunc_frac=trunc_frac,
     )
 
-    if not res.ok and res.reason == "decode_error" and is_flac(item_format, path):
-        trailer = detect_trailing_tag(path)
-        if trailer is not None:
-            audio_end, tag_kind = trailer
-            retry = _run_ffmpeg_piped_prefix(
-                path=path,
-                limit_bytes=audio_end,
-                header_s=header_s,
-                item_format=item_format,
-                ffmpeg_bin=ffmpeg_bin,
-                timeout=timeout,
-                min_check_s=min_check_s,
-                trunc_abs_s=trunc_abs_s,
-                trunc_frac=trunc_frac,
-            )
-            if retry is not None:
-                if retry.ok:
-                    retry.trailing_tag = tag_kind
-                return retry
+    if not res.ok and res.reason == "decode_error":
+        input_fmt = _trailing_tag_input_format(item_format, path)
+        if input_fmt is not None:
+            trailer = detect_trailing_tag(path)
+            if trailer is not None:
+                audio_end, tag_kind = trailer
+                retry = _run_ffmpeg_piped_prefix(
+                    path=path,
+                    limit_bytes=audio_end,
+                    header_s=header_s,
+                    item_format=item_format,
+                    input_format=input_fmt,
+                    ffmpeg_bin=ffmpeg_bin,
+                    timeout=timeout,
+                    min_check_s=min_check_s,
+                    trunc_abs_s=trunc_abs_s,
+                    trunc_frac=trunc_frac,
+                )
+                if retry is not None:
+                    if retry.ok:
+                        retry.trailing_tag = tag_kind
+                    return retry
 
     return res
 

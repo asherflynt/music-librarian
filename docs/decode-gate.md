@@ -84,24 +84,37 @@ slskd download -> /downloads (staging) -> beets import (Soulbeet)
      ignores FLAC frame CRCs, and bit flips inside audio data with intact
      framing decode with no error at all (verified 2026-11-24, ffmpeg 8.0.1).
      Other formats do not get it: MP3 CRCs are optional and cannot be trusted.
-   - **FLAC trailing non-FLAC tags (ID3v1 / TAG+ / APEv1 / APEv2):** some older
-     taggers append an ID3v1 tag (`TAG` at `size - 128`, optionally preceded by
-     a 227-byte ID3v1 enhanced `TAG+` block) and/or an APEv1/APEv2 footer
-     (`APETAGEX` in the last 32 bytes, either at EOF or before an ID3v1 tag,
-     sized from the footer including its optional 32-byte header flag) after
-     the last FLAC frame. FFmpeg tries to parse those bytes as another FLAC
-     frame and fails at EOF with `invalid sync code` / `invalid frame header` /
+   - **FLAC and MP3 trailing tags (ID3v1 / TAG+ / Lyrics3v1 / Lyrics3v2 / APEv1 / APEv2):**
+     some older taggers append trailing metadata blocks — possibly stacked in
+     any order — after the last audio frame:
+     - ID3v1 (`TAG`, 128 B) and optional ID3v1 enhanced (`TAG+`, 227 B before ID3v1)
+     - Lyrics3v2 (6-digit ASCII byte count + `LYRICS200` immediately before
+       ID3v1 or at EOF, validated by `LYRICSBEGIN` at the computed start offset)
+     - Lyrics3v1 (`LYRICSBEGIN` ... `LYRICSEND`, max 5100 B, only valid before ID3v1)
+     - APEv1/APEv2 footer (`APETAGEX`, 32-byte footer sized including its
+       optional 32-byte header flag)
+
+     FFmpeg's FLAC demuxer tries to decode these trailers as a FLAC frame and
+     fails at EOF with `invalid sync code` / `invalid frame header` /
      `decode_frame() failed` (verified 2026-11-25 on 192 FLACs in *The Complete
-     Ella Fitzgerald Song Books*). When a FLAC's first decode fails with
-     `decode_error` and such a trailing tag is detected, the plugin streams
-     only the bytes before the trailer to a second identical ffmpeg decode via
-     `-f flac -i pipe:0` (with `-err_detect crccheck` and the same timeout /
-     `checker_unavailable` semantics, never modifying the file on disk). The
-     file is accepted only if that second decode exits 0 with no non-ignored
-     stderr and passes the truncation and `no_duration` rules; `trailing_tag`
-     (e.g. `"id3v1"`, `"id3v1+"`, `"apev2"`, `"apev2+id3v1"`) is recorded on
-     the accepted `checked.jsonl` line. Any mid-file corruption, CRC error, or
-     truncation still rejects.
+     Ella Fitzgerald Song Books*). FFmpeg's MP3 demuxer skips ID3v1 but does
+     not skip Lyrics3, so Lyrics3+ID3v1 MP3s fail in the last ~2 s with
+     `[mp3float @ ...] Header missing` / `Error submitting packet to decoder:
+     Invalid data found when processing input` (verified 2026-11-26 on 13 MP3s
+     in *Hi-Five - The Return*).
+
+     When a FLAC or MP3 fails its first decode with `decode_error` and
+     repeatedly peeling recognized trailers finds one or more valid trailing
+     tags, the plugin streams only the bytes before the trailer to a second
+     identical ffmpeg decode via `-f flac -i pipe:0` (with `-err_detect
+     crccheck` for FLAC) or `-f mp3 -i pipe:0` (for MP3), keeping the same
+     timeout / `checker_unavailable` semantics and never modifying the file on
+     disk. The file is accepted only if that second decode exits 0 with no
+     non-ignored stderr and passes the truncation (and lossless `no_duration`)
+     rules; `trailing_tag` (e.g. `"id3v1"`, `"id3v1+"`, `"apev2"`,
+     `"apev2+id3v1"`, `"lyrics3v2+id3v1"`) is recorded on the accepted
+     `checked.jsonl` line. Any mid-file corruption, CRC error, or truncation
+     still rejects.
 3. **Truncation:** if the header length is over 15 s and decoded <
    header - max(5 s, 5%), the reason is `truncated`.
 4. **No duration:** if the header length is 0 or missing for a lossless file,

@@ -325,6 +325,33 @@ def _make_id3v1_enhanced(title: str = "Extended Title") -> bytes:
     return block
 
 
+def _ffmpeg_has_mp3_encoder() -> bool:
+    if not os.path.exists(FFMPEG_BIN):
+        return False
+    try:
+        proc = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and "libmp3lame" in proc.stdout
+
+
+HAS_MP3_ENCODER = _ffmpeg_has_mp3_encoder()
+
+
+def _make_lyrics3v2(fields: bytes = b"IND0000200CRC00008EDEB4646") -> bytes:
+    body = b"LYRICSBEGIN" + fields
+    return body + f"{len(body):06d}".encode("ascii") + b"LYRICS200"
+
+
+def _make_lyrics3v1(lyrics: bytes = b"Hello world\r\nLine two") -> bytes:
+    return b"LYRICSBEGIN" + lyrics + b"LYRICSEND"
+
+
 def _make_apev2_tag(
     *,
     items: list[tuple[str, bytes]] | None = None,
@@ -935,6 +962,130 @@ class PureLogicTests(unittest.TestCase):
             self.assertIsNone(dc.detect_trailing_tag(str(bad_size)))
 
             self.assertIsNone(dc.detect_trailing_tag(str(root / "missing.flac")))
+
+    def test_detect_trailing_tag_bytes_lyrics3_and_stacks(self):
+        base = b"\xff\xfb\x90\x00" + b"\xaa\x55\x11\x22" * 64
+
+        # Lyrics3v2 alone at EOF.
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(base + _make_lyrics3v2()),
+            (len(base), "lyrics3v2"),
+        )
+
+        # Lyrics3v2 + ID3v1 (matches real Hi-Five - The Return layout).
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(base + _make_lyrics3v2() + _make_id3v1()),
+            (len(base), "lyrics3v2+id3v1"),
+        )
+
+        # Lyrics3v2 + TAG+ + ID3v1.
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(
+                base + _make_lyrics3v2() + _make_id3v1_enhanced() + _make_id3v1()
+            ),
+            (len(base), "lyrics3v2+id3v1+"),
+        )
+
+        # Lyrics3v1 + ID3v1 -> accepted.
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(base + _make_lyrics3v1() + _make_id3v1()),
+            (len(base), "lyrics3v1+id3v1"),
+        )
+
+        # Lyrics3v1 alone at EOF (no ID3v1) -> NOT valid, must not strip.
+        self.assertIsNone(dc.detect_trailing_tag_bytes(base + _make_lyrics3v1()))
+
+        # Lyrics3v1 followed only by APEv2 (no ID3v1) -> peels APEv2 only.
+        l3v1 = _make_lyrics3v1()
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(base + l3v1 + _make_apev2_tag()),
+            (len(base) + len(l3v1), "apev2"),
+        )
+
+        # Lyrics3v1 exact max boundary (5100 B total) vs oversized (5101 B).
+        max_l3v1 = _make_lyrics3v1(b"a" * (5100 - len(b"LYRICSBEGIN") - len(b"LYRICSEND")))
+        self.assertEqual(len(max_l3v1), 5100)
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(base + max_l3v1 + _make_id3v1()),
+            (len(base), "lyrics3v1+id3v1"),
+        )
+        over_l3v1 = _make_lyrics3v1(b"a" * (5101 - len(b"LYRICSBEGIN") - len(b"LYRICSEND")))
+        self.assertEqual(len(over_l3v1), 5101)
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(base + over_l3v1 + _make_id3v1()),
+            (len(base) + len(over_l3v1), "id3v1"),
+        )
+
+        # Stacked APE + Lyrics3 + ID3v1 in multiple orders.
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(
+                base + _make_apev2_tag() + _make_lyrics3v2() + _make_id3v1()
+            ),
+            (len(base), "apev2+lyrics3v2+id3v1"),
+        )
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(
+                base + _make_apev2_tag() + _make_lyrics3v1() + _make_id3v1()
+            ),
+            (len(base), "apev2+lyrics3v1+id3v1"),
+        )
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(
+                base + _make_lyrics3v2() + _make_apev2_tag() + _make_id3v1()
+            ),
+            (len(base), "lyrics3v2+apev2+id3v1"),
+        )
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(
+                base
+                + _make_apev2_tag(with_header=False, version=1000)
+                + _make_lyrics3v2()
+                + _make_id3v1_enhanced()
+                + _make_id3v1()
+            ),
+            (len(base), "apev1+lyrics3v2+id3v1+"),
+        )
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(base + _make_id3v1() + _make_apev2_tag()),
+            (len(base), "id3v1+apev2"),
+        )
+
+        # APEv2 whose payload happens to contain "TAG" at offset -128 must still
+        # peel as APEv2, not be mis-parsed as ID3v1.
+        ape_with_tag_word = _make_apev2_tag(
+            items=[("Comment", b"A" * 50 + b"TAG" + b"B" * 150)],
+            with_header=True,
+        )
+        self.assertEqual(
+            dc.detect_trailing_tag_bytes(base + ape_with_tag_word),
+            (len(base), "apev2"),
+        )
+
+        # Bogus Lyrics3v2 size fields / missing LYRICSBEGIN -> no strip.
+        bogus_cases = [
+            # Non-digit character in 6-byte size field
+            base + b"LYRICSBEGININD0000200" + b"00002a" + b"LYRICS200",
+            # Leading space in size field
+            base + b"LYRICSBEGININD0000200" + b" 00021" + b"LYRICS200",
+            # Size smaller than len("LYRICSBEGIN") (11)
+            base + b"LYRICSBEGIN" + b"000005" + b"LYRICS200",
+            # Off-by-one size (LYRICSBEGIN not at computed offset)
+            base + b"LYRICSBEGININD0000200" + b"000020" + b"LYRICS200",
+            base + b"LYRICSBEGININD0000200" + b"000022" + b"LYRICS200",
+            # Size larger than file
+            base + b"LYRICSBEGININD0000200" + b"999999" + b"LYRICS200",
+            # Valid size length, but wrong magic instead of LYRICSBEGIN
+            base + b"NOTLYRICS!!IND0000200" + b"000021" + b"LYRICS200",
+        ]
+        for idx, buf in enumerate(bogus_cases):
+            with self.subTest(bogus_idx=idx):
+                self.assertIsNone(dc.detect_trailing_tag_bytes(buf))
+                # Even when followed by a valid ID3v1, the bogus Lyrics3v2 is
+                # NOT stripped (only the valid 128-byte ID3v1 peels off).
+                self.assertEqual(
+                    dc.detect_trailing_tag_bytes(buf + _make_id3v1()),
+                    (len(buf), "id3v1"),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1638,6 +1789,135 @@ class RealFFmpegTests(unittest.TestCase):
             self.assertEqual(
                 checked[0]["trailing_tag_details"],
                 [{"basename": "100 - Squatty Roo.flac", "kind": "id3v1"}],
+            )
+
+    @unittest.skipUnless(HAS_MP3_ENCODER, "ffmpeg libmp3lame encoder not available")
+    def test_mp3_with_trailing_lyrics3_and_id3v1_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "short.mp3"
+            _gen_mp3(src, duration_s=18)
+            raw = src.read_bytes()
+
+            # Confirm raw MP3 decodes cleanly on its own.
+            r0 = dc.run_ffmpeg_decode(str(src), 18.0, "MP3", ffmpeg_bin=FFMPEG_BIN)
+            self.assertTrue(r0.ok, r0)
+
+            cases = [
+                (
+                    "lyrics3v2_id3v1.mp3",
+                    raw + _make_lyrics3v2() + _make_id3v1(),
+                    "lyrics3v2+id3v1",
+                ),
+                (
+                    "lyrics3v2_only.mp3",
+                    raw + _make_lyrics3v2(),
+                    "lyrics3v2",
+                ),
+                (
+                    "lyrics3v1_id3v1.mp3",
+                    raw + _make_lyrics3v1() + _make_id3v1(),
+                    "lyrics3v1+id3v1",
+                ),
+                (
+                    "lyrics3v2_apev2_id3v1.mp3",
+                    raw + _make_lyrics3v2() + _make_apev2_tag() + _make_id3v1(),
+                    "lyrics3v2+apev2+id3v1",
+                ),
+            ]
+            for name, payload, expected_tag in cases:
+                with self.subTest(case=name):
+                    p = root / name
+                    p.write_bytes(payload)
+                    res = dc.run_ffmpeg_decode(
+                        str(p), 18.0, "MP3", ffmpeg_bin=FFMPEG_BIN
+                    )
+                    self.assertTrue(res.ok, f"{name}: {res}")
+                    self.assertEqual(res.trailing_tag, expected_tag)
+                    self.assertAlmostEqual(res.decoded_s, 18.0, delta=0.3)
+                    # Audio file on disk must never be modified.
+                    self.assertEqual(p.read_bytes(), payload)
+
+            # FLAC with stacked APEv2 + Lyrics3v2 + ID3v1 also peels cleanly.
+            flac_stack = root / "apev2_lyrics3v2_id3v1.flac"
+            flac_payload = (
+                self.good_flac.read_bytes()
+                + _make_apev2_tag()
+                + _make_lyrics3v2()
+                + _make_id3v1()
+            )
+            flac_stack.write_bytes(flac_payload)
+            res_f = dc.run_ffmpeg_decode(
+                str(flac_stack), 20.0, "FLAC", ffmpeg_bin=FFMPEG_BIN
+            )
+            self.assertTrue(res_f.ok, res_f)
+            self.assertEqual(res_f.trailing_tag, "apev2+lyrics3v2+id3v1")
+            self.assertEqual(flac_stack.read_bytes(), flac_payload)
+
+    @unittest.skipUnless(HAS_MP3_ENCODER, "ffmpeg libmp3lame encoder not available")
+    def test_mp3_midfile_corruption_with_lyrics3v2_id3v1_still_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "short.mp3"
+            _gen_mp3(src, duration_s=18)
+            raw = bytearray(src.read_bytes())
+            # Corrupt a chunk right in the middle of the MP3 audio frames.
+            mid = len(raw) // 2
+            raw[mid : mid + 512] = b"\x00" * 512
+            bad = root / "corrupt_lyrics3.mp3"
+            bad.write_bytes(bytes(raw) + _make_lyrics3v2() + _make_id3v1())
+
+            res = dc.run_ffmpeg_decode(str(bad), 18.0, "MP3", ffmpeg_bin=FFMPEG_BIN)
+            self.assertFalse(res.ok, res)
+            self.assertEqual(res.reason, "decode_error")
+            self.assertIsNone(res.trailing_tag)
+
+            # Truncated MP3 + Lyrics3v2 + ID3v1 must still reject.
+            trunc = root / "trunc_lyrics3.mp3"
+            trunc.write_bytes(
+                src.read_bytes()[: len(raw) // 3] + _make_lyrics3v2() + _make_id3v1()
+            )
+            res_t = dc.run_ffmpeg_decode(
+                str(trunc), 18.0, "MP3", ffmpeg_bin=FFMPEG_BIN
+            )
+            self.assertFalse(res_t.ok, res_t)
+            self.assertIn(res_t.reason, ("truncated", "decode_error"))
+            self.assertIsNone(res_t.trailing_tag)
+
+    @unittest.skipUnless(HAS_MP3_ENCODER, "ffmpeg libmp3lame encoder not available")
+    def test_plugin_records_mp3_lyrics3v2_trailing_tag_in_checked_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = Path(tmp) / "downloads"
+            state_dir = downloads / ".decodecheck"
+            alb = downloads / "The Return [155104be]"
+            alb.mkdir(parents=True)
+            f1 = alb / "01 - Intro.mp3"
+            _gen_mp3(f1, duration_s=18)
+            payload = f1.read_bytes() + _make_lyrics3v2() + _make_id3v1()
+            f1.write_bytes(payload)
+
+            plugin = dc.DecodeCheckPlugin()
+            plugin.config.set("state_dir", str(state_dir))
+            plugin.config.set("ffmpeg", FFMPEG_BIN)
+            task = _FakeImportTask(
+                str(alb).encode(),
+                [str(alb).encode()],
+                [_FakeItem(str(f1), length=18.0, fmt="MP3", track=1)],
+            )
+            self.assertEqual(plugin.on_import_task_created(None, task), [task])
+            self.assertFalse((state_dir / "rejects.jsonl").exists())
+            self.assertEqual(f1.read_bytes(), payload)
+
+            checked = [
+                json.loads(ln)
+                for ln in (state_dir / "checked.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(checked), 1)
+            self.assertEqual(checked[0]["trailing_tag"], "lyrics3v2+id3v1")
+            self.assertEqual(checked[0]["trailing_tag_files"], 1)
+            self.assertEqual(
+                checked[0]["trailing_tag_details"],
+                [{"basename": "01 - Intro.mp3", "kind": "lyrics3v2+id3v1"}],
             )
 
     def test_probe_extra_audio_mutagen_valid_unreadable_and_vanished(self):
