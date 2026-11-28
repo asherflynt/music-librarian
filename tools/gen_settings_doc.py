@@ -23,7 +23,8 @@ GROUPS = [
     ("Targets & pacing", ["TARGET_TB", "TARGET_TRACKS", "EXPLORE_RATIO",
                           "EXPLORE_MAX_INACTIVE_YEARS", "MIN_FREE_GB",
                           "STAGING_MIN_FREE_GB", "CONCURRENCY", "TASTE_REFRESH_MIN",
-                          "MEASURE_EVERY_SEC", "SCAN_MAX_PROBES_PER_PASS",
+                          "MEASURE_EVERY_SEC", "LIBRARY_SCAN_ROOT",
+                          "SCAN_MAX_PROBES_PER_PASS",
                           "ERROR_RETRY_DAYS", "ERROR_MAX_ATTEMPTS", "PAUSED"]),
     ("Taste weighting", ["TASTE_HALF_LIFE_DAYS", "WEIGHT_NAVIDROME", "WEIGHT_PLEX",
                          "WEIGHT_YTMUSIC"]),
@@ -67,6 +68,8 @@ def render():
             if kind == "bool":
                 dv = {"1": "on", "0": "off"}.get(dv, dv)
                 rng = "on / off"
+            elif kind == "str":
+                rng = "auto or absolute path"
             else:
                 rng = f"{lo} – {hi}"
             lines.append(f"#### `{k}`")

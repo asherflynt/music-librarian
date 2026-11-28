@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -52,6 +53,8 @@ SOULBEET_URL = os.environ.get("SOULBEET_URL", "http://soulbeet:9765").rstrip("/"
 NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "http://navidrome:4533").rstrip("/")
 TAUTULLI_URL = os.environ.get("TAUTULLI_URL", "").rstrip("/")       # Plex/Plexamp play history
 MUSIC_PATH = Path(os.environ.get("MUSIC_PATH", "/music"))          # library, for size/count
+DEFAULT_LIBRARY_SCAN_ROOT = os.environ.get("LIBRARY_SCAN_ROOT", "auto")
+AUTO_SCAN_ROOT_CANDIDATE = Path(os.environ.get("LIBRARY_SCAN_AUTO_PATH", "/cluster/Media/Music"))
 FREE_SPACE_PATH = os.environ.get("FREE_SPACE_PATH", "/music")       # cluster pool: library-size floor
 STAGING_PATH = os.environ.get("STAGING_PATH", "/staging")           # NVMe staging: overflow floor
 TARGET_FOLDER = os.environ.get("TARGET_FOLDER", "/music")           # beets destination in Soulbeet
@@ -185,6 +188,7 @@ def load_config():
         "CONCURRENCY": max(1, num("CONCURRENCY", 3, int)),
         "TASTE_REFRESH_MIN": num("TASTE_REFRESH_MIN", 360, int),   # re-pull play counts every 6h
         "MEASURE_EVERY_SEC": num("MEASURE_EVERY_SEC", 300, int),
+        "LIBRARY_SCAN_ROOT": (c.get("LIBRARY_SCAN_ROOT") or DEFAULT_LIBRARY_SCAN_ROOT).strip() or "auto",
         "SCAN_MAX_PROBES_PER_PASS": max(1, num("SCAN_MAX_PROBES_PER_PASS", 250, int)),
         "ERROR_RETRY_DAYS": max(0, num("ERROR_RETRY_DAYS", 7, int)),
         "ERROR_MAX_ATTEMPTS": max(1, num("ERROR_MAX_ATTEMPTS", 3, int)),
@@ -707,6 +711,14 @@ class State:
             self.conn.commit()
 
     # -- library inventory ----------------------------------------------------
+    def library_totals(self):
+        """(total_bytes, track_count) from persisted library_files rows."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM library_files"
+            ).fetchone()
+        return (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
+
     def known_files(self):
         """path -> (size, mtime), so the scanner can skip unchanged files."""
         with self.lock:
@@ -2609,23 +2621,179 @@ def _tags_of(path, fallback_dir):
     return artist, album
 
 
-def measure_library(state=None, max_probes=None):
+def translate_library_path(path, src_root, dst_root):
+    """Translate a library path from `src_root` prefix to `dst_root` prefix.
+
+    Preserves exact relative path components (including Unicode names and
+    nested directories) and enforces path-boundary matching so sibling prefixes
+    like `/cluster/Media/Music2` are never rewritten.
+    """
+    p = str(path)
+    src = os.path.normpath(str(src_root))
+    dst = os.path.normpath(str(dst_root))
+    if src == dst:
+        return p
+    if p == src:
+        return dst
+    sep = os.sep
+    prefix = src if src.endswith(sep) else src + sep
+    if p.startswith(prefix):
+        rel = p[len(prefix):]
+        return (dst + rel) if dst.endswith(sep) else (dst + sep + rel)
+    return p
+
+
+def _sample_dir_entries(path, limit):
+    """Return up to `limit` non-upgrade entry names from `path` using os.scandir."""
+    names = []
+    with os.scandir(path) as it:
+        for entry in it:
+            if entry.name == UPGRADE_DIRNAME:
+                continue
+            names.append(entry.name)
+            if len(names) >= limit:
+                break
+    return names
+
+
+def _stat_pair_matches(cand_path, music_path):
+    """Compare two filesystem paths using inode-independent metadata.
+
+    FUSE user shares (/mnt/user) and direct pool mounts (/mnt/cluster) have
+    different st_dev and st_ino for the same underlying files, so verification
+    relies on file type, size, and integer mtime.
+    """
+    try:
+        st_c = os.stat(cand_path)
+        st_m = os.stat(music_path)
+    except OSError:
+        return None, False
+
+    c_is_dir = stat.S_ISDIR(st_c.st_mode)
+    m_is_dir = stat.S_ISDIR(st_m.st_mode)
+    if c_is_dir != m_is_dir:
+        return None, False
+    if c_is_dir:
+        if int(st_c.st_mtime) != int(st_m.st_mtime):
+            return None, False
+        return "dir", True
+
+    c_is_reg = stat.S_ISREG(st_c.st_mode)
+    m_is_reg = stat.S_ISREG(st_m.st_mode)
+    if c_is_reg != m_is_reg:
+        return None, False
+    if c_is_reg:
+        if st_c.st_size != st_m.st_size or int(st_c.st_mtime) != int(st_m.st_mtime):
+            return None, False
+        return "file", True
+
+    return "other", True
+
+
+def _trees_match(candidate, music_path, sample_size=8):
+    """Verify `candidate` exposes the same library tree as `music_path`.
+
+    Samples top-level entries from both roots and descends up to 2 levels into
+    a few sampled subdirectories to confirm inode-independent signatures
+    (entry names, types, sizes, and mtimes) match on both sides.
+    """
+    cand = Path(candidate)
+    music = Path(music_path)
+    try:
+        if not cand.is_dir() or not music.is_dir():
+            return False
+        if os.path.realpath(cand) == os.path.realpath(music):
+            return True
+        music_names = _sample_dir_entries(music, sample_size)
+        cand_names = _sample_dir_entries(cand, sample_size)
+    except OSError:
+        return False
+
+    names = list(dict.fromkeys(music_names + cand_names))
+    if not names:
+        return False
+
+    matched_files = 0
+    matched_dirs = []
+    for name in names:
+        kind, ok = _stat_pair_matches(cand / name, music / name)
+        if not ok:
+            return False
+        if kind == "file":
+            matched_files += 1
+        elif kind == "dir":
+            matched_dirs.append(name)
+
+    # Descend into a few sampled subdirs (Artist -> Album -> track) so regular
+    # file names, sizes, and mtimes are verified even when top-level entries
+    # are all artist directories.
+    queue = [(d, 1) for d in matched_dirs[:3]]
+    while queue and matched_files < 4:
+        rel_dir, depth = queue.pop(0)
+        try:
+            sub_m = _sample_dir_entries(music / rel_dir, 4)
+            sub_c = _sample_dir_entries(cand / rel_dir, 4)
+        except OSError:
+            return False
+        sub_names = list(dict.fromkeys(sub_m + sub_c))
+        for name in sub_names:
+            rel_child = os.path.join(rel_dir, name)
+            kind, ok = _stat_pair_matches(cand / rel_child, music / rel_child)
+            if not ok:
+                return False
+            if kind == "file":
+                matched_files += 1
+            elif kind == "dir" and depth < 2:
+                queue.append((rel_child, depth + 1))
+
+    return True
+
+
+def resolve_scan_root(setting="auto", music_path=None, auto_candidate=None):
+    """Resolve the filesystem root to walk during library scans.
+
+    Returns (scan_root_path, reason_str). Never returns a write target — the
+    returned path is used strictly for read-only walk/stat/probe calls, and all
+    paths persisted in `library_files` are translated back to `music_path`.
+    """
+    music = Path(music_path) if music_path is not None else MUSIC_PATH
+    cand_default = (Path(auto_candidate) if auto_candidate is not None
+                    else AUTO_SCAN_ROOT_CANDIDATE)
+    raw = (str(setting) if setting is not None else "auto").strip()
+    if not raw or raw.lower() == "auto":
+        if _trees_match(cand_default, music):
+            return cand_default, "auto-detected direct pool mount"
+        return music, "auto fallback to MUSIC_PATH"
+
+    explicit = Path(os.path.normpath(raw))
+    if os.path.normpath(str(explicit)) == os.path.normpath(str(music)):
+        return music, "configured"
+    if _trees_match(explicit, music):
+        return explicit, "configured (verified match)"
+    log(f"LIBRARY_SCAN_ROOT={explicit} does not exist or does not match {music}; "
+        f"falling back to {music}")
+    return music, "configured mismatch fallback"
+
+
+def measure_library(state=None, max_probes=None, scan_root=None, music_path=None):
     """Walk the library once for size, track count, and per-file quality.
 
     Incremental: a file whose (size, mtime) is unchanged is not re-opened, so the
-    steady-state cost is a stat() per file rather than a tag parse. That matters --
-    this runs every MEASURE_EVERY_SEC against a library headed for 100k files.
+    steady-state cost is a stat() per file rather than a tag parse.
 
-    `max_probes` bounds how many NEW/CHANGED files get opened per pass, and exists
-    for a specific reason: the library is reached through Unraid's /mnt/user FUSE
-    layer (shfs), which is a single-threaded chokepoint shared with Plex, slskd,
-    beets and everything else on the box. Walking it to stat() files is cheap and has
-    always been fine, but *opening* every file to read tags is not -- doing that to
-    the whole library in one tight loop is believed to be what wedged the server on
-    2026-07-17 (every process touching /mnt/user piled into uninterruptible D state
-    until a hard reboot). Probing is therefore rate-limited and simply resumes next
-    pass: the walk stays complete and correct, only the expensive part is spread out.
+    When `scan_root` differs from `music_path` (e.g., walking the read-only ZFS
+    mount `/cluster/Media/Music` instead of Unraid's FUSE `/music` share), all
+    walk/stat/probe reads go through `scan_root`, while every path stored or
+    compared in `library_files` is translated back to the canonical `music_path`
+    prefix (`/music/...`) so existing rows match without re-probing or
+    duplicating anything.
     """
+    started = time.monotonic()
+    canonical_base = os.path.normpath(str(music_path if music_path is not None else MUSIC_PATH))
+    walk_base = os.path.normpath(str(scan_root if scan_root is not None else canonical_base))
+    if not os.path.isdir(walk_base):
+        raise OSError(f"library scan root is not a directory: {walk_base}")
+
     total_bytes = 0
     track_count = 0
     known = state.known_files() if state else {}
@@ -2634,64 +2802,199 @@ def measure_library(state=None, max_probes=None):
     reprobed = 0
     unprobed = 0
 
-    for root, dirs, files in os.walk(MUSIC_PATH):
+    for root, dirs, files in os.walk(walk_base):
         # The upgrade staging dir lives inside the library tree (see UPGRADE_FOLDER).
         # It must not be counted: staged files are unverified, would double-count
         # albums we already own, and -- since they're FLAC awaiting a swap -- would
         # skew the lossless stats toward a state that isn't real yet.
         if UPGRADE_DIRNAME in dirs:
             dirs.remove(UPGRADE_DIRNAME)
+        canonical_root = translate_library_path(root, walk_base, canonical_base)
         for f in files:
             ext = os.path.splitext(f)[1].lower()
             if ext not in AUDIO_EXTS:
                 continue
-            full = os.path.join(root, f)
+            full_scan = os.path.join(root, f)
             try:
-                st = os.stat(full)
+                st = os.stat(full_scan)
             except OSError:
                 continue
             track_count += 1
             total_bytes += st.st_size
             if not state:
                 continue
-            seen.add(full)
-            prev = known.get(full)
+            canonical_full = os.path.join(canonical_root, f)
+            seen.add(canonical_full)
+            prev = known.get(canonical_full)
             if prev and prev[0] == st.st_size and prev[1] == int(st.st_mtime):
                 continue
             # Budget exhausted: leave it for the next pass rather than hammering
-            # shfs. Size/track totals above are already counted, so only the quality
-            # breakdown lags -- and it catches up on its own.
+            # storage. Size/track totals above are already counted, so only the
+            # quality breakdown lags -- and it catches up on its own.
             if max_probes is not None and reprobed >= max_probes:
                 unprobed += 1
                 continue
-            probed = probe_file(full)
+            probed = probe_file(full_scan)
             if not probed:
                 continue
             codec, lossless, kbps = probed
-            artist, album = _tags_of(full, root)
-            pending.append((full, root, artist, album, codec, int(lossless), kbps,
-                            st.st_size, int(st.st_mtime), int(time.time())))
+            artist, album = _tags_of(full_scan, canonical_root)
+            pending.append((canonical_full, canonical_root, artist, album, codec,
+                            int(lossless), kbps, st.st_size, int(st.st_mtime),
+                            int(time.time())))
             reprobed += 1
-            if len(pending) >= 500:
+            if len(pending) >= 250:
                 state.put_files(pending)
                 pending = []
 
     if state:
         if pending:
             state.put_files(pending)
-        gone = set(known) - seen
+        gone = list(set(known) - seen)
         if gone:
-            state.drop_files(gone)   # files removed/renamed shouldn't linger in stats
-        if reprobed or gone or unprobed:
-            msg = f"Library scan: {reprobed} new/changed file(s) probed"
-            if gone:
-                msg += f", {len(gone)} removed"
-            if unprobed:
-                msg += (f", {unprobed} awaiting probe (rate-limited to "
-                        f"{max_probes}/pass to protect the /mnt/user FUSE layer)")
-            log(msg)
+            for i in range(0, len(gone), 500):
+                state.drop_files(gone[i:i + 500])
+        elapsed = time.monotonic() - started
+        msg = (f"Library scan ({walk_base}, {elapsed:.1f}s): "
+               f"{reprobed} new/changed file(s) probed")
+        if gone:
+            msg += f", {len(gone)} removed"
+        if unprobed:
+            msg += (f", {unprobed} awaiting probe (rate-limited to "
+                    f"{max_probes}/pass)")
+        log(msg)
         state.set_meta("unprobed_files", unprobed)
     return total_bytes, track_count
+
+
+class LibraryScanner:
+    """Runs periodic library scans on a single background thread so the main
+    candidate-processing loop is never starved while walking the library.
+
+    Guarantees at most one scan runs at a time, updates cached totals atomically
+    on completion, and produces STATUS / status.json after each completed scan.
+    """
+
+    def __init__(self, state, get_cfg=None, measure_fn=None,
+                 resolve_root_fn=None, free_gb_fn=None, write_status_fn=None):
+        self.state = state
+        self.get_cfg = get_cfg or load_config
+        self._measure_fn = measure_fn or measure_library
+        self._resolve_root_fn = resolve_root_fn or resolve_scan_root
+        self._free_gb_fn = free_gb_fn or free_gb
+        self._write_status_fn = write_status_fn or write_status
+
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+        self._last_finished = 0.0
+        self._last_scan_root = None
+        self._last_duration = None
+        self._scan_count = 0
+        self._last_error = None
+
+        # Seed initial totals from persisted library_files rows so stop_reason()
+        # has accurate library size/track counts immediately on startup while the
+        # first background scan runs.
+        init_bytes, init_tracks = state.library_totals() if state else (0, 0)
+        self._lib_bytes = init_bytes
+        self._track_count = init_tracks
+        self._free_gb = self._free_gb_fn(FREE_SPACE_PATH)
+
+    @property
+    def is_running(self):
+        with self._lock:
+            return self._running
+
+    def snapshot(self):
+        """Return latest (lib_bytes, track_count, free_gb) thread-safely."""
+        with self._lock:
+            return self._lib_bytes, self._track_count, self._free_gb
+
+    def last_scan_info(self):
+        with self._lock:
+            return {
+                "running": self._running,
+                "scan_root": self._last_scan_root,
+                "duration_sec": self._last_duration,
+                "scan_count": self._scan_count,
+                "last_finished": self._last_finished,
+                "last_error": self._last_error,
+            }
+
+    def reset_schedule(self):
+        """Allow the next maybe_start() to trigger immediately (unless running)."""
+        with self._lock:
+            self._last_finished = 0.0
+
+    def maybe_start(self, cfg, force=False):
+        """Launch a background scan if due and none is already running.
+
+        Returns True if a new background scan was started, False otherwise.
+        """
+        now = time.time()
+        with self._lock:
+            if self._running:
+                return False
+            if (not force and self._last_finished > 0
+                    and (now - self._last_finished) <= cfg["MEASURE_EVERY_SEC"]):
+                return False
+            self._running = True
+            t = threading.Thread(
+                target=self._run,
+                args=(dict(cfg),),
+                name="library-scan",
+                daemon=True,
+            )
+            self._thread = t
+        t.start()
+        return True
+
+    def wait(self, timeout=None):
+        """Wait for the current background scan thread (if any) to finish."""
+        with self._lock:
+            t = self._thread
+        if t is not None:
+            t.join(timeout=timeout)
+        return not self.is_running
+
+    def _run(self, cfg):
+        t0 = time.monotonic()
+        try:
+            scan_root, reason = self._resolve_root_fn(cfg.get("LIBRARY_SCAN_ROOT", "auto"))
+            with self._lock:
+                prev_root = self._last_scan_root
+                self._last_scan_root = str(scan_root)
+            if prev_root != str(scan_root):
+                log(f"Library scan root: {scan_root} ({reason}; canonical prefix {MUSIC_PATH})")
+
+            lib_bytes, track_count = self._measure_fn(
+                self.state,
+                max_probes=cfg["SCAN_MAX_PROBES_PER_PASS"],
+                scan_root=scan_root,
+            )
+            free = self._free_gb_fn(FREE_SPACE_PATH)
+            elapsed = time.monotonic() - t0
+            with self._lock:
+                self._lib_bytes = lib_bytes
+                self._track_count = track_count
+                self._free_gb = free
+                self._last_duration = elapsed
+                self._scan_count += 1
+                self._last_error = None
+            status_cfg = self.get_cfg() if self.get_cfg else cfg
+            self._write_status_fn(
+                self.state, status_cfg, lib_bytes, track_count, free,
+                scan_root=str(scan_root), scan_duration_sec=elapsed,
+            )
+        except Exception as e:
+            with self._lock:
+                self._last_error = str(e)
+            log(f"Library scan error (non-fatal): {e}")
+        finally:
+            with self._lock:
+                self._last_finished = time.time()
+                self._running = False
 
 
 def free_gb(path):
@@ -3354,7 +3657,11 @@ def upgrade_loop(state, sb, get_cfg, is_busy):
             time.sleep(300)
 
 
-def write_status(state, cfg, lib_bytes, track_count, free):
+_STATUS_WRITE_LOCK = threading.Lock()
+
+
+def write_status(state, cfg, lib_bytes, track_count, free,
+                 scan_root=None, scan_duration_sec=None):
     counts = state.status_counts()
     tb = lib_bytes / (1024 ** 4)
     status = {
@@ -3432,12 +3739,20 @@ def write_status(state, cfg, lib_bytes, track_count, free):
         log(f"decode gate status failed (non-fatal): {e}")
         status["decode_gate"] = None
     status["paused"] = bool(cfg["PAUSED"])
+    if scan_root is not None:
+        status["scan_root"] = str(scan_root)
+    if scan_duration_sec is not None:
+        status["scan_duration_sec"] = round(float(scan_duration_sec), 2)
     reason = stop_reason(cfg, lib_bytes, track_count, free)
     status["stop_reason"] = reason.message if reason else None
-    try:
-        STATUS_JSON.write_text(json.dumps(status, indent=2))
-    except OSError:
-        pass
+    payload = json.dumps(status, indent=2)
+    with _STATUS_WRITE_LOCK:
+        try:
+            tmp = STATUS_JSON.with_name(STATUS_JSON.name + ".tmp")
+            tmp.write_text(payload)
+            os.replace(tmp, STATUS_JSON)
+        except OSError:
+            pass
     log("STATUS " + json.dumps({k: status[k] for k in
         ("library_tb", "tracks", "pct_to_target", "cluster_free_gb",
          "queued_flac", "queued_alac", "queued_lossy", "lossless_pct", "pending")}))
@@ -3552,23 +3867,17 @@ def main():
     threading.Thread(target=upgrade_loop, daemon=True,
                      args=(state, sb, load_config, busy.is_set)).start()
 
-    last_measure = 0
-    lib_bytes, track_count, free = 0, 0, float("inf")
+    scanner = LibraryScanner(state, get_cfg=load_config)
 
     while True:
         cfg = load_config()
         exclude_set = load_exclude_set()
 
-        # periodic library measurement (throttled — walking 100k files is not free).
-        # Runs before the pause/stop checks so the UI stays live and the status file
-        # always reflects the real state — including `paused`, so the UI's Pause
-        # button correctly flips to Resume while we're idling below.
-        if time.time() - last_measure > cfg["MEASURE_EVERY_SEC"]:
-            lib_bytes, track_count = measure_library(
-                state, max_probes=cfg["SCAN_MAX_PROBES_PER_PASS"])
-            free = free_gb(FREE_SPACE_PATH)
-            last_measure = time.time()
-            write_status(state, cfg, lib_bytes, track_count, free)
+        # Periodic library measurement runs on a single background thread so
+        # walking the library never starves downloads. Triggered before pause/
+        # stop checks so status.json stays fresh even while paused or idling.
+        scanner.maybe_start(cfg)
+        lib_bytes, track_count, _ = scanner.snapshot()
 
         # Learn from the decode gate every iteration (cheap: one stat() when idle),
         # even while paused, so a rejected album is re-queued from another peer.
@@ -3606,7 +3915,7 @@ def main():
                 log(f"STOP CONDITION: {reason}. Idling 5 min (raise targets in the UI or "
                     f"config.env to resume).")
                 time.sleep(300)
-                last_measure = 0  # force re-measure after idle
+                scanner.reset_schedule()  # force re-measure after idle
                 continue
 
         if not favorites_only:
@@ -3647,7 +3956,7 @@ def main():
                 log(f"STOP CONDITION: {reason} (favorites synced, none pending). "
                     f"Idling 5 min (raise targets in the UI or config.env to resume discovery).")
                 time.sleep(300)
-                last_measure = 0  # force re-measure after idle
+                scanner.reset_schedule()  # force re-measure after idle
                 continue
             log(f"Cap reached ({reason}); processing {len(batch)} favorite candidate(s)")
         else:

@@ -18,6 +18,7 @@ import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 # Every knob the UI is allowed to write, with its type and bounds. A POST touching
@@ -34,6 +35,7 @@ SETTINGS = {
     "CONCURRENCY":              ("int", 1, 16),
     "TASTE_REFRESH_MIN":        ("int", 5, 100_000),
     "MEASURE_EVERY_SEC":        ("int", 30, 86_400),
+    "LIBRARY_SCAN_ROOT":        ("str", None, None),
     "SCAN_MAX_PROBES_PER_PASS": ("int", 10, 100_000),
     "ERROR_RETRY_DAYS":         ("int", 0, 365),
     "ERROR_MAX_ATTEMPTS":       ("int", 1, 20),
@@ -139,9 +141,23 @@ HELP = {
         "How often to re-scan the library (seconds)",
         "How often the librarian walks the library to recount size, tracks, and audio "
         "quality.\n\n"
-        "The scan is incremental — files that haven't changed are not re-read — so this "
-        "is cheap. Lower it if you want the progress numbers to feel more live; raise it "
-        "if the disk is busy."),
+        "Scans run in a background thread so downloads keep queuing while a scan is in "
+        "progress, and files whose size and mtime haven't changed are not re-read. "
+        "Lower it if you want the progress numbers to feel more live; raise it if the "
+        "disk is busy."),
+    "LIBRARY_SCAN_ROOT": (
+        "Read-only directory tree to walk during library scans",
+        "Where the background library scanner reads directory listings and audio "
+        "metadata from.\n\n"
+        "At the default 'auto', the librarian checks whether /cluster/Media/Music "
+        "(Unraid's direct read-only ZFS pool mount) exists and matches /music by "
+        "verifying sample entry names, sizes, and mtimes. When it matches, scans walk "
+        "ZFS directly — avoiding Unraid's single-threaded /mnt/user FUSE (shfs) "
+        "bottleneck under disk load — and otherwise fall back to /music.\n\n"
+        "All paths stored in state.db are translated back to /music/... regardless of "
+        "the scan root, so existing inventory rows, upgrades, and UI stats stay "
+        "identical. Set to /music to force FUSE scanning, or another absolute path to "
+        "a read-only mount of the same library."),
     "SCAN_MAX_PROBES_PER_PASS": (
         "How many new files to analyse per scan (safety limit)",
         "How many new or changed files the librarian opens per scan pass to read "
@@ -481,6 +497,17 @@ def coerce(key, raw):
         if isinstance(raw, bool):
             return "1" if raw else "0"
         return "1" if str(raw).strip().lower() in ("1", "true", "yes", "on") else "0"
+    if kind == "str":
+        s = str(raw if raw is not None else "").strip()
+        if not s or s.lower() == "auto":
+            return "auto"
+        if any(ch in s for ch in ("\r", "\n", "\x00", "#", '"', "'")):
+            raise ValueError(f"{key}: invalid characters in path")
+        if not s.startswith("/"):
+            raise ValueError(f"{key}: must be 'auto' or an absolute path starting with '/'")
+        if ".." in Path(s).parts:
+            raise ValueError(f"{key}: '..' is not allowed")
+        return os.path.normpath(s)
     try:
         v = float(raw)
     except (TypeError, ValueError):
@@ -897,6 +924,7 @@ const tip = () => $('#tip');
 function showTip(el, k){
   const h = HELP[k]; if(!h) return;
   const bounds = h.kind === 'bool' ? 'on / off'
+    : h.kind === 'str' ? 'allowed: auto or absolute path'
     : `allowed: ${h.min} – ${h.max}${h.kind === 'int' ? ' (whole numbers)' : ''}`;
   tip().innerHTML = `<h4>${esc(k)}</h4>` +
     h.detail.split('\n\n').map(p => `<p>${esc(p)}</p>`).join('') +
@@ -922,7 +950,9 @@ function buildSettings(cfg){
     const h = HELP[k] || {};
     const field = isBool(k)
       ? `<select data-k="${k}"><option value="0">off</option><option value="1">on</option></select>`
-      : `<input data-k="${k}" type="number" step="any">`;
+      : (h.kind === 'str'
+        ? `<input data-k="${k}" type="text" placeholder="auto">`
+        : `<input data-k="${k}" type="number" step="any">`);
     return `<div class="setting" data-help="${k}">
       <label><span class="name">${k}</span><span class="q">?</span>
       <span class="desc">${esc(h.short || '')}</span></label>${field}</div>`;

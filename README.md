@@ -186,7 +186,16 @@ The default of 360 (6 hours) is plenty — your taste doesn't change by the minu
 
 How often the librarian walks the library to recount size, tracks, and audio quality.
 
-The scan is incremental — files that haven't changed are not re-read — so this is cheap. Lower it if you want the progress numbers to feel more live; raise it if the disk is busy.
+Scans run in a background thread so downloads keep queuing while a scan is in progress, and files whose size and mtime haven't changed are not re-read. Lower it if you want the progress numbers to feel more live; raise it if the disk is busy.
+
+#### `LIBRARY_SCAN_ROOT`
+**Read-only directory tree to walk during library scans** · default `auto` · auto or absolute path
+
+Where the background library scanner reads directory listings and audio metadata from.
+
+At the default 'auto', the librarian checks whether /cluster/Media/Music (Unraid's direct read-only ZFS pool mount) exists and matches /music by verifying sample entry names, sizes, and mtimes. When it matches, scans walk ZFS directly — avoiding Unraid's single-threaded /mnt/user FUSE (shfs) bottleneck under disk load — and otherwise fall back to /music.
+
+All paths stored in state.db are translated back to /music/... regardless of the scan root, so existing inventory rows, upgrades, and UI stats stay identical. Set to /music to force FUSE scanning, or another absolute path to a read-only mount of the same library.
 
 #### `SCAN_MAX_PROBES_PER_PASS`
 **How many new files to analyse per scan (safety limit)** · default `250` · 10 – 100000
