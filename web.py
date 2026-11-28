@@ -28,6 +28,7 @@ SETTINGS = {
     "TARGET_TB":                ("float", 0.0, 500.0),
     "TARGET_TRACKS":            ("int", 0, 100_000_000),
     "EXPLORE_RATIO":            ("float", 0.0, 1.0),
+    "EXPLORE_MAX_INACTIVE_YEARS": ("int", 0, 100),
     "MIN_FREE_GB":              ("float", 0.0, 100_000.0),
     "STAGING_MIN_FREE_GB":      ("float", 0.0, 100_000.0),
     "CONCURRENCY":              ("int", 1, 16),
@@ -50,6 +51,10 @@ SETTINGS = {
     "FAVORITE_INCLUDE_LIVE":    ("bool", 0, 1),
     "FAVORITE_INCLUDE_COMPILATIONS": ("bool", 0, 1),
     "FAVORITE_INCLUDE_REMIX":   ("bool", 0, 1),
+    "NEW_RELEASE_SYNC_HOURS":   ("int", 1, 8760),
+    "NEW_RELEASE_TOP_ARTISTS":  ("int", 0, 5000),
+    "NEW_RELEASE_MAX_AGE_DAYS": ("int", 1, 3650),
+    "NEW_RELEASE_PRIORITY":     ("int", 0, 10_000),
     "UPGRADE_ENABLED":          ("bool", 0, 1),
     "UPGRADE_HOUR":             ("int", 0, 23),
     "UPGRADE_MAX_PER_RUN":      ("int", 1, 1000),
@@ -88,10 +93,20 @@ HELP = {
         "How adventurous the recommendations are.\n\n"
         "At 0 the librarian only fetches more of what you already play and artists that "
         "sound like them. At 1 it only chases artists you don't own from genres you lean "
-        "into. The default 0.3 spends about 70% of its effort deepening your existing "
-        "taste and 30% stretching it.\n\n"
+        "into. The default 0.15 spends about 85% of its effort deepening your existing "
+        "taste and 15% stretching it.\n\n"
         "Turn it down if you're getting music you don't recognise; turn it up if the "
         "library feels like an echo chamber."),
+    "EXPLORE_MAX_INACTIVE_YEARS": (
+        "Skip tag-explored artists inactive for this many years (0 = off)",
+        "Stops broad genre tags (like 'rock' or 'soul') from flooding the queue with "
+        "classic acts whose careers ended decades ago.\n\n"
+        "When tag exploration suggests an artist, the librarian checks any cached "
+        "MusicBrainz life-span (ended year) and cached Last.fm decade tags — with zero "
+        "extra API calls — and skips artists clearly inactive for longer than this many "
+        "years. Artists you play directly or reach via close similarity are never "
+        "filtered.\n\n"
+        "Set to 0 to allow tag exploration of arbitrarily old/ended artists."),
     "MIN_FREE_GB": (
         "Hard floor — never fill the pool below this",
         "A safety net for your storage pool. If free space on the cluster pool drops "
@@ -257,6 +272,38 @@ HELP = {
         "Whether remix releases count.\n\n"
         "Off by default. Remixes are the single biggest source of near-duplicates — for "
         "Glass Animals there are 26 remix singles alone."),
+
+    "NEW_RELEASE_SYNC_HOURS": (
+        "How often to check top played artists for new releases (hours)",
+        "How often to ask MusicBrainz whether your top played artists (not just "
+        "favourites) have released new albums or EPs.\n\n"
+        "Work is spread in small batches across main-loop passes so MusicBrainz's "
+        "1 req/s rate limit never stalls downloads. Artist MBIDs are cached in state.db "
+        "so each artist is resolved once. Release-type filters reuse the "
+        "FAVORITE_INCLUDE_* settings (albums + EPs by default)."),
+    "NEW_RELEASE_TOP_ARTISTS": (
+        "How many top played artists to watch for new releases (0 = off)",
+        "How many of your highest-weighted artists (ranked by play-derived taste "
+        "weight, excluding blocklisted/kids artists and active favourites already "
+        "covered by favorites sync) are watched for new releases on MusicBrainz.\n\n"
+        "At the default 500, newly released albums from artists you actually play are "
+        "spotted and queued automatically without having to star every one of them. "
+        "Set to 0 to watch favourites only."),
+    "NEW_RELEASE_MAX_AGE_DAYS": (
+        "Max age (days) of releases queued by the new-release watch",
+        "How recent a release's MusicBrainz first-release-date must be to qualify for "
+        "the played-artist new-release watch.\n\n"
+        "At the default 730 (two years), recent albums and EPs from your top played "
+        "artists are queued ahead of the general discovery backlog without pulling "
+        "every artist's entire back catalogue. Use Favourites if you want an artist's "
+        "complete discography."),
+    "NEW_RELEASE_PRIORITY": (
+        "Queue priority for played-artist new releases",
+        "Base queue priority given to recent releases spotted for top played artists.\n\n"
+        "Defaults to 50 — below FAVORITE_PRIORITY (100) so starred artists always go "
+        "first, and well above normal discovery (0) so new releases jump ahead of the "
+        "general backlog. Recent releases also receive a small recency bonus (always "
+        "capped below FAVORITE_PRIORITY when favourites rank higher)."),
 
     "UPGRADE_ENABLED": (
         "Re-download lossy albums as FLAC when one appears",
@@ -785,6 +832,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:
 
     <div class="card">
       <h2>New releases</h2>
+      <div class="sub" id="nrwatch" style="margin-bottom:8px"></div>
       <div class="scroll"><table id="newrel"></table></div>
     </div>
 
@@ -1002,11 +1050,19 @@ async function load(){
 
     // favorites + new releases
     renderFavs(s.favorites, fav.names);
+    const nrw = s.new_release_watch || null;
+    if(nrw && nrw.watched_artists){
+      $('#nrwatch').textContent = `Watch: ${(nrw.synced_recent??0).toLocaleString()}/${nrw.watched_artists.toLocaleString()} synced · ` +
+        `${(nrw.mbids_cached??0).toLocaleString()} MBIDs cached · ` +
+        `${(nrw.releases_30d??0).toLocaleString()} found (30d)`;
+    } else {
+      $('#nrwatch').textContent = '';
+    }
     $('#newrel').innerHTML = (s.new_releases||[]).length
       ? (s.new_releases||[]).map(n => `<tr><td><b>${esc(n.artist)}</b><br>
           <span class="sub">${esc(n.album)}</span></td>
           <td style="text-align:right" class="sub">${esc(n.released||'')}</td></tr>`).join('')
-      : '<tr><td class="muted">Nothing new yet. Favorites are checked every FAVORITE_SYNC_HOURS.</td></tr>';
+      : '<tr><td class="muted">Nothing new yet. Favorites and top played artists are checked on their sync cadence.</td></tr>';
 
     // fallbacks
     $('#fb').innerHTML = (s.recent_fallbacks||[]).length

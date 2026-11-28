@@ -136,13 +136,22 @@ The other finish line: stop once the library holds this many tracks. Whichever t
 In practice size is almost always the binding limit — 100,000 FLAC tracks would be far more than 3 TB — so treat this as a safety ceiling rather than the real goal.
 
 #### `EXPLORE_RATIO`
-**0 = only what you love · 1 = only new horizons** · default `0.30` · 0.0 – 1.0
+**0 = only what you love · 1 = only new horizons** · default `0.15` · 0.0 – 1.0
 
 How adventurous the recommendations are.
 
-At 0 the librarian only fetches more of what you already play and artists that sound like them. At 1 it only chases artists you don't own from genres you lean into. The default 0.3 spends about 70% of its effort deepening your existing taste and 30% stretching it.
+At 0 the librarian only fetches more of what you already play and artists that sound like them. At 1 it only chases artists you don't own from genres you lean into. The default 0.15 spends about 85% of its effort deepening your existing taste and 15% stretching it.
 
 Turn it down if you're getting music you don't recognise; turn it up if the library feels like an echo chamber.
+
+#### `EXPLORE_MAX_INACTIVE_YEARS`
+**Skip tag-explored artists inactive for this many years (0 = off)** · default `15` · 0 – 100
+
+Stops broad genre tags (like 'rock' or 'soul') from flooding the queue with classic acts whose careers ended decades ago.
+
+When tag exploration suggests an artist, the librarian checks any cached MusicBrainz life-span (ended year) and cached Last.fm decade tags — with zero extra API calls — and skips artists clearly inactive for longer than this many years. Artists you play directly or reach via close similarity are never filtered.
+
+Set to 0 to allow tag exploration of arbitrarily old/ended artists.
 
 #### `MIN_FREE_GB`
 **Hard floor — never fill the pool below this** · default `500` · 0.0 – 100000.0
@@ -317,6 +326,36 @@ Off by default, because if you already have the studio albums a compilation is a
 Whether remix releases count.
 
 Off by default. Remixes are the single biggest source of near-duplicates — for Glass Animals there are 26 remix singles alone.
+
+### New-release watch (top played artists)
+
+#### `NEW_RELEASE_SYNC_HOURS`
+**How often to check top played artists for new releases (hours)** · default `24` · 1 – 8760
+
+How often to ask MusicBrainz whether your top played artists (not just favourites) have released new albums or EPs.
+
+Work is spread in small batches across main-loop passes so MusicBrainz's 1 req/s rate limit never stalls downloads. Artist MBIDs are cached in state.db so each artist is resolved once. Release-type filters reuse the FAVORITE_INCLUDE_* settings (albums + EPs by default).
+
+#### `NEW_RELEASE_TOP_ARTISTS`
+**How many top played artists to watch for new releases (0 = off)** · default `500` · 0 – 5000
+
+How many of your highest-weighted artists (ranked by play-derived taste weight, excluding blocklisted/kids artists and active favourites already covered by favorites sync) are watched for new releases on MusicBrainz.
+
+At the default 500, newly released albums from artists you actually play are spotted and queued automatically without having to star every one of them. Set to 0 to watch favourites only.
+
+#### `NEW_RELEASE_MAX_AGE_DAYS`
+**Max age (days) of releases queued by the new-release watch** · default `730` · 1 – 3650
+
+How recent a release's MusicBrainz first-release-date must be to qualify for the played-artist new-release watch.
+
+At the default 730 (two years), recent albums and EPs from your top played artists are queued ahead of the general discovery backlog without pulling every artist's entire back catalogue. Use Favourites if you want an artist's complete discography.
+
+#### `NEW_RELEASE_PRIORITY`
+**Queue priority for played-artist new releases** · default `50` · 0 – 10000
+
+Base queue priority given to recent releases spotted for top played artists.
+
+Defaults to 50 — below FAVORITE_PRIORITY (100) so starred artists always go first, and well above normal discovery (0) so new releases jump ahead of the general backlog. Recent releases also receive a small recency bonus (always capped below FAVORITE_PRIORITY when favourites rank higher).
 
 ### Lossy → FLAC upgrades
 

@@ -178,7 +178,8 @@ def load_config():
     return {
         "TARGET_TB": num("TARGET_TB", 3.0, float),
         "TARGET_TRACKS": num("TARGET_TRACKS", 100000, int),
-        "EXPLORE_RATIO": num("EXPLORE_RATIO", 0.30, float),
+        "EXPLORE_RATIO": num("EXPLORE_RATIO", 0.15, float),
+        "EXPLORE_MAX_INACTIVE_YEARS": max(0, num("EXPLORE_MAX_INACTIVE_YEARS", 15, int)),
         "MIN_FREE_GB": num("MIN_FREE_GB", 500, float),
         "STAGING_MIN_FREE_GB": num("STAGING_MIN_FREE_GB", 80, float),
         "CONCURRENCY": max(1, num("CONCURRENCY", 3, int)),
@@ -203,6 +204,11 @@ def load_config():
         "FAVORITE_INCLUDE_LIVE": flag("FAVORITE_INCLUDE_LIVE", "0"),
         "FAVORITE_INCLUDE_COMPILATIONS": flag("FAVORITE_INCLUDE_COMPILATIONS", "0"),
         "FAVORITE_INCLUDE_REMIX": flag("FAVORITE_INCLUDE_REMIX", "0"),
+        # new-release watch for top played artists (reuses FAVORITE_INCLUDE_* rules)
+        "NEW_RELEASE_SYNC_HOURS": max(1, num("NEW_RELEASE_SYNC_HOURS", 24, int)),
+        "NEW_RELEASE_TOP_ARTISTS": max(0, num("NEW_RELEASE_TOP_ARTISTS", 500, int)),
+        "NEW_RELEASE_MAX_AGE_DAYS": max(1, num("NEW_RELEASE_MAX_AGE_DAYS", 730, int)),
+        "NEW_RELEASE_PRIORITY": max(0, num("NEW_RELEASE_PRIORITY", 50, int)),
         # scheduled lossy -> FLAC upgrades
         "UPGRADE_ENABLED": flag("UPGRADE_ENABLED", "0"),
         "UPGRADE_HOUR": min(23, max(0, num("UPGRADE_HOUR", 3, int))),
@@ -234,8 +240,20 @@ def db_connect():
         CREATE TABLE IF NOT EXISTS artists_seen (
             name TEXT PRIMARY KEY,      -- normalized artist name
             display TEXT,
-            weight REAL DEFAULT 0,      -- taste weight (play count derived)
+            weight REAL DEFAULT 0,      -- taste weight (play count + propagated)
+            play_weight REAL DEFAULT 0, -- direct play-derived weight from refresh_taste
+            depth INTEGER DEFAULT 0,    -- 0=direct seed, 1=similar hop, 2+=propagated/explored
             expanded_at INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS artist_mb (
+            name TEXT PRIMARY KEY,      -- normalized artist name
+            mbid TEXT,                  -- resolved MusicBrainz UUID, or '' if not found
+            mb_name TEXT,
+            ended INTEGER DEFAULT 0,    -- 1 if MB life-span.ended is true
+            end_year INTEGER,           -- parsed year from MB life-span.end
+            resolved_at INTEGER DEFAULT 0,
+            last_nr_sync INTEGER DEFAULT 0,
+            note TEXT
         );
         CREATE TABLE IF NOT EXISTS candidates (
             key TEXT PRIMARY KEY,       -- normalized 'artist|album' or 'artist|track'
@@ -243,6 +261,8 @@ def db_connect():
             status TEXT DEFAULT 'pending',   -- pending|queued_flac|queued_alac|queued_lossy|no_source|low_quality_only|no_meta|error|exists|corrupt_only
             fmt TEXT,                   -- actual format chosen: flac|alac|mp3|m4a|aac
             kbps INTEGER,               -- measured bitrate of what was queued
+            release_year INTEGER,       -- known release year (from MB or Soulbeet)
+            artist_weight REAL DEFAULT 0, -- cached taste weight for fast pending order
             updated_at INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS artist_tags (
@@ -361,7 +381,14 @@ def _migrate(conn):
     def cols(table):
         return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
+    cand_cols_before = cols("candidates")
+    need_weight_backfill = bool(cand_cols_before) and "artist_weight" not in cand_cols_before
+
     for table, name, decl in (
+        ("artists_seen", "play_weight", "REAL DEFAULT 0"),
+        # Pre-existing rows default to depth=2 so already-propagated legacy artists
+        # don't keep chaining; refresh_taste resets directly seeded artists to 0.
+        ("artists_seen", "depth", "INTEGER DEFAULT 2"),
         ("candidates", "fmt", "TEXT"),
         ("candidates", "kbps", "INTEGER"),
         # Favorites must outrank the exploration crawl, or a full discography would
@@ -372,6 +399,8 @@ def _migrate(conn):
         ("candidates", "attempts", "INTEGER DEFAULT 0"),
         # Cap how many times a decode-rejected candidate is re-queued from other peers.
         ("candidates", "decode_retries", "INTEGER DEFAULT 0"),
+        ("candidates", "release_year", "INTEGER"),
+        ("candidates", "artist_weight", "REAL DEFAULT 0"),
         # Decode-gate matching keys that survive slskd's filename rewrites.
         ("downloads", "norm_basename", "TEXT"),
         ("downloads", "norm_remote_dir", "TEXT"),
@@ -383,8 +412,19 @@ def _migrate(conn):
         if name not in have:
             log(f"Migrating state.db: adding {table}.{name}")
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    if need_weight_backfill and cols("artists_seen"):
+        log("Migrating state.db: backfilling candidates.artist_weight for pending rows")
+        conn.execute(
+            "UPDATE candidates SET artist_weight = COALESCE("
+            "(SELECT weight FROM artists_seen "
+            " WHERE name = substr(candidates.key, 1, instr(candidates.key, '|') - 1)), 0) "
+            "WHERE status='pending'"
+        )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_pending "
                  "ON candidates(status, priority DESC, updated_at)")
+    if "artist_weight" in cols("candidates"):
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_pending_order "
+                     "ON candidates(status, priority DESC, artist_weight DESC, updated_at ASC)")
     if "norm_basename" in cols("downloads"):
         for rid, bn, rd in conn.execute(
                 "SELECT id, basename, remote_dir FROM downloads "
@@ -425,17 +465,32 @@ class State:
         self.conn = db_connect()
         self.lock = threading.Lock()
 
-    def upsert_artist(self, name, weight=0.0):
+    def upsert_artist(self, name, weight=0.0, depth=0, play_weight=None):
         n = norm(name)
         if not n:
             return
+        pw = float(play_weight) if play_weight is not None else 0.0
         with self.lock:
-            self.conn.execute(
-                "INSERT INTO artists_seen(name, display, weight) VALUES(?,?,?) "
-                "ON CONFLICT(name) DO UPDATE SET weight=MAX(weight, excluded.weight), "
-                "display=COALESCE(display, excluded.display)",
-                (n, name, weight),
-            )
+            if play_weight is not None:
+                self.conn.execute(
+                    "INSERT INTO artists_seen(name, display, weight, play_weight, depth) "
+                    "VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(name) DO UPDATE SET "
+                    "weight=MAX(weight, excluded.weight), "
+                    "play_weight=excluded.play_weight, "
+                    "depth=MIN(COALESCE(depth, excluded.depth), excluded.depth), "
+                    "display=COALESCE(display, excluded.display)",
+                    (n, name, weight, pw, int(depth)),
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO artists_seen(name, display, weight, depth) VALUES(?,?,?,?) "
+                    "ON CONFLICT(name) DO UPDATE SET "
+                    "weight=MAX(weight, excluded.weight), "
+                    "depth=MIN(COALESCE(depth, excluded.depth), excluded.depth), "
+                    "display=COALESCE(display, excluded.display)",
+                    (n, name, weight, int(depth)),
+                )
             self.conn.commit()
 
     def mark_expanded(self, name):
@@ -447,12 +502,13 @@ class State:
     def unexpanded_artists(self, limit=50):
         with self.lock:
             rows = self.conn.execute(
-                "SELECT display, weight FROM artists_seen WHERE expanded_at=0 "
+                "SELECT display, weight, COALESCE(depth, 0) FROM artists_seen WHERE expanded_at=0 "
                 "ORDER BY weight DESC, name ASC LIMIT ?", (limit,)
             ).fetchall()
         return rows
 
-    def add_candidate(self, artist, album, kind, priority=0):
+    def add_candidate(self, artist, album, kind, priority=0, release_year=None,
+                      artist_weight=None):
         """Returns True only if this is a brand-new candidate.
 
         Written as an explicit SELECT-then-write rather than INSERT..ON CONFLICT DO
@@ -460,24 +516,98 @@ class State:
         path -- callers count on the return value meaning "new", and the old
         INSERT OR IGNORE gave that for free.
         """
-        key = f"{norm(artist)}|{norm(album or '')}|{kind}"
+        anorm = norm(artist)
+        key = f"{anorm}|{norm(album or '')}|{kind}"
         with self.lock:
-            row = self.conn.execute("SELECT priority FROM candidates WHERE key=?",
-                                    (key,)).fetchone()
+            if artist_weight is None:
+                aw_row = self.conn.execute(
+                    "SELECT weight FROM artists_seen WHERE name=?", (anorm,)
+                ).fetchone()
+                aw = float(aw_row[0] or 0.0) if aw_row else 0.0
+            else:
+                aw = float(artist_weight or 0.0)
+            row = self.conn.execute(
+                "SELECT priority, release_year, COALESCE(artist_weight, 0) "
+                "FROM candidates WHERE key=?",
+                (key,),
+            ).fetchone()
             if row is None:
                 self.conn.execute(
-                    "INSERT INTO candidates(key, artist, album, kind, priority, updated_at) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (key, artist, album, kind, priority, int(time.time())))
+                    "INSERT INTO candidates(key, artist, album, kind, priority, "
+                    "release_year, artist_weight, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (key, artist, album, kind, priority, release_year, aw, int(time.time())))
                 self.conn.commit()
                 return True
             # Already known: an album queued by exploration that later turns out to
-            # belong to a favorite gets promoted rather than silently left at the back.
-            if priority > (row[0] or 0):
-                self.conn.execute("UPDATE candidates SET priority=? WHERE key=?",
-                                  (priority, key))
+            # belong to a favorite or new-release watch gets promoted rather than
+            # silently left at the back.
+            cur_prio, cur_year, cur_aw = row[0] or 0, row[1], float(row[2] or 0.0)
+            updates, params = [], []
+            if priority > cur_prio:
+                updates.append("priority=?")
+                params.append(priority)
+            if release_year is not None and cur_year is None:
+                updates.append("release_year=?")
+                params.append(int(release_year))
+            if aw > cur_aw:
+                updates.append("artist_weight=?")
+                params.append(aw)
+            if updates:
+                params.append(key)
+                self.conn.execute(f"UPDATE candidates SET {', '.join(updates)} WHERE key=?",
+                                  params)
                 self.conn.commit()
             return False
+
+    def promote_pending_candidate(self, artist, album, kind, priority, release_year=None):
+        """Promote an already-pending candidate's priority and backfill release_year.
+
+        Used when MusicBrainz release-groups are already fetched in memory: enriches
+        existing Last.fm candidates with recency priority without adding new albums.
+        """
+        key = f"{norm(artist)}|{norm(album or '')}|{kind}"
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT status, COALESCE(priority, 0), release_year FROM candidates WHERE key=?",
+                (key,),
+            ).fetchone()
+            if not row or row[0] != "pending":
+                return False
+            cur_prio, cur_year = int(row[1] or 0), row[2]
+            updates, params = [], []
+            if priority > cur_prio:
+                updates.append("priority=?")
+                params.append(int(priority))
+            if release_year is not None and cur_year is None:
+                updates.append("release_year=?")
+                params.append(int(release_year))
+            if not updates:
+                return False
+            params.append(key)
+            self.conn.execute(f"UPDATE candidates SET {', '.join(updates)} WHERE key=?", params)
+            self.conn.commit()
+            return True
+
+    def set_candidate_release_year(self, key, release_year):
+        if release_year is None:
+            return
+        with self.lock:
+            self.conn.execute(
+                "UPDATE candidates SET release_year=? WHERE key=? AND release_year IS NULL",
+                (int(release_year), key),
+            )
+            self.conn.commit()
+
+    def sync_pending_artist_weights(self):
+        """Refresh cached artist_weight on pending candidates after refresh_taste."""
+        with self.lock:
+            self.conn.execute(
+                "UPDATE candidates SET artist_weight = COALESCE("
+                "(SELECT weight FROM artists_seen "
+                " WHERE name = substr(candidates.key, 1, instr(candidates.key, '|') - 1)), 0) "
+                "WHERE status='pending'"
+            )
+            self.conn.commit()
 
     def pending_candidates(self, limit, min_priority=None):
         with self.lock:
@@ -485,13 +615,15 @@ class State:
                 rows = self.conn.execute(
                     "SELECT key, artist, album, kind FROM candidates "
                     "WHERE status='pending' AND priority >= ? "
-                    "ORDER BY priority DESC, updated_at ASC LIMIT ?",
+                    "ORDER BY priority DESC, COALESCE(artist_weight, 0) DESC, updated_at ASC "
+                    "LIMIT ?",
                     (min_priority, limit),
                 ).fetchall()
             else:
                 rows = self.conn.execute(
                     "SELECT key, artist, album, kind FROM candidates WHERE status='pending' "
-                    "ORDER BY priority DESC, updated_at ASC LIMIT ?", (limit,)
+                    "ORDER BY priority DESC, COALESCE(artist_weight, 0) DESC, updated_at ASC "
+                    "LIMIT ?", (limit,)
                 ).fetchall()
         return rows
 
@@ -700,6 +832,124 @@ class State:
                 "SELECT artist, album, released, found_at FROM new_releases "
                 "ORDER BY found_at DESC LIMIT ?", (limit,)).fetchall()
 
+    # -- artist MusicBrainz cache + played-artist new-release watch -----------
+    def get_artist_mb(self, name):
+        n = norm(name)
+        if not n:
+            return None
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT name, mbid, mb_name, ended, end_year, resolved_at, last_nr_sync, note "
+                "FROM artist_mb WHERE name=?", (n,)
+            ).fetchone()
+        if not r:
+            return None
+        return {
+            "name": r[0], "mbid": r[1], "mb_name": r[2],
+            "ended": bool(r[3]), "end_year": r[4],
+            "resolved_at": r[5] or 0, "last_nr_sync": r[6] or 0, "note": r[7],
+        }
+
+    def put_artist_mb(self, name, mbid, mb_name=None, ended=False, end_year=None,
+                      resolved_at=None, last_nr_sync=None, note=None):
+        n = norm(name)
+        if not n:
+            return
+        now = int(time.time())
+        res_ts = now if resolved_at is None else int(resolved_at)
+        sync_ts = 0 if last_nr_sync is None else int(last_nr_sync)
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO artist_mb(name, mbid, mb_name, ended, end_year, "
+                "resolved_at, last_nr_sync, note) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "mbid=excluded.mbid, "
+                "mb_name=COALESCE(excluded.mb_name, mb_name), "
+                "ended=excluded.ended, "
+                "end_year=excluded.end_year, "
+                "resolved_at=excluded.resolved_at, "
+                "last_nr_sync=CASE WHEN excluded.last_nr_sync > 0 THEN excluded.last_nr_sync ELSE last_nr_sync END, "
+                "note=excluded.note",
+                (n, mbid if mbid is not None else "", mb_name, int(bool(ended)),
+                 end_year, res_ts, sync_ts, note),
+            )
+            self.conn.commit()
+
+    def touch_artist_nr_sync(self, name, ts=None):
+        n = norm(name)
+        if not n:
+            return
+        now = int(time.time() if ts is None else ts)
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO artist_mb(name, mbid, resolved_at, last_nr_sync) "
+                "VALUES(?, NULL, 0, ?) "
+                "ON CONFLICT(name) DO UPDATE SET last_nr_sync=excluded.last_nr_sync",
+                (n, now),
+            )
+            self.conn.commit()
+
+    def top_watched_artists(self, limit=500, exclude_favorites=True):
+        """Top taste-weighted artists for played-artist new-release watch.
+
+        Prefers direct play-derived weight from refresh_taste (play_weight > 0),
+        falling back to overall taste weight so it also works before the first
+        refresh_taste or when fewer than `limit` artists have direct plays.
+        """
+        if limit <= 0:
+            return []
+        fav_clause = "AND f.name IS NULL " if exclude_favorites else ""
+        q = (
+            "SELECT a.name, COALESCE(a.display, a.name), a.weight, COALESCE(a.play_weight, 0), "
+            "       m.mbid, m.mb_name, COALESCE(m.resolved_at, 0), COALESCE(m.last_nr_sync, 0), "
+            "       f.mbid "
+            "FROM artists_seen a "
+            "LEFT JOIN artist_mb m ON m.name = a.name "
+            "LEFT JOIN favorites f ON f.name = a.name "
+            f"WHERE (COALESCE(a.play_weight, 0) > 0 OR COALESCE(a.weight, 0) > 0) {fav_clause}"
+            "ORDER BY (CASE WHEN COALESCE(a.play_weight, 0) > 0 THEN 1 ELSE 0 END) DESC, "
+            "         COALESCE(a.play_weight, 0) DESC, a.weight DESC, a.name ASC "
+            "LIMIT ?"
+        )
+        with self.lock:
+            return self.conn.execute(q, (int(limit),)).fetchall()
+
+    def new_release_watch_stats(self, top_n, sync_hours, exclude_favorites=True, now=None):
+        now = int(time.time() if now is None else now)
+        cutoff = now - max(1, int(sync_hours)) * 3600
+        rows = self.top_watched_artists(limit=max(0, int(top_n)),
+                                        exclude_favorites=exclude_favorites)
+        watched = len(rows)
+        synced_recent = sum(1 for r in rows if (r[7] or 0) >= cutoff)
+        with self.lock:
+            mbids_cached = self.conn.execute(
+                "SELECT COUNT(*) FROM artist_mb WHERE mbid IS NOT NULL AND mbid != ''"
+            ).fetchone()[0]
+            releases_total = self.conn.execute(
+                "SELECT COUNT(*) FROM new_releases"
+            ).fetchone()[0]
+            releases_30d = self.conn.execute(
+                "SELECT COUNT(*) FROM new_releases WHERE found_at >= ?",
+                (now - 30 * 86400,),
+            ).fetchone()[0]
+        raw_summary = self.get_meta("last_new_release_summary")
+        last_summary = None
+        if raw_summary:
+            try:
+                last_summary = json.loads(raw_summary)
+            except ValueError:
+                last_summary = None
+        return {
+            "watched_artists": watched,
+            "synced_recent": synced_recent,
+            "due": max(0, watched - synced_recent),
+            "mbids_cached": mbids_cached,
+            "releases_total": releases_total,
+            "releases_30d": releases_30d,
+            "last_sync": int(self.get_meta("last_new_release_sync", "0") or 0),
+            "last_summary": last_summary,
+        }
+
     # -- decode gate: downloads, bad_sources, rejects -------------------------
     def record_downloads(self, kind, ref_key, items, search_id, ts=None):
         """One row per queued item, so a decode-gate reject can be traced back to
@@ -893,6 +1143,14 @@ class State:
                 "FROM candidates WHERE key=?",
                 (key,),
             ).fetchone()
+
+    def candidate_priority(self, key):
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT COALESCE(priority, 0) FROM candidates WHERE key=?",
+                (key,),
+            ).fetchone()
+        return int(r[0]) if r else None
 
     def upgrade_info(self, key):
         with self.lock:
@@ -1733,20 +1991,37 @@ class MusicBrainz:
             time.sleep(2 * (attempt + 1))
         return None
 
-    def resolve_mbid(self, artist):
-        """Artist name -> MBID. Returns None rather than guessing on a weak match."""
+    def resolve_artist_info(self, artist):
+        """Artist name -> (info_dict, None) or (None, note).
+
+        Extracts MusicBrainz MBID alongside life-span metadata already present in
+        the same /ws/2/artist response (zero extra API calls).
+        """
         q = artist.replace('"', "")
         data = self._get("artist", "artists", query=f'artist:"{q}"', limit=5)
         if not data:
             return None, "lookup failed"
         for a in data.get("artists", []):
             if int(a.get("score", 0)) >= 90:
-                return a["id"], a.get("name")
+                ls = a.get("life-span") or {}
+                return {
+                    "mbid": a["id"],
+                    "name": a.get("name"),
+                    "ended": bool(ls.get("ended")),
+                    "end_year": parse_release_year(ls.get("end")),
+                }, None
         if data.get("artists"):
             best = data["artists"][0]
             return None, (f"no confident match (best: {best.get('name')} "
                           f"@ score {best.get('score')})")
         return None, "not found in MusicBrainz"
+
+    def resolve_mbid(self, artist):
+        """Artist name -> MBID. Returns None rather than guessing on a weak match."""
+        info, note = self.resolve_artist_info(artist)
+        if info:
+            return info["mbid"], info.get("name")
+        return None, note
 
     def release_groups(self, mbid):
         """Every release-group for an artist, paginated."""
@@ -1762,6 +2037,82 @@ class MusicBrainz:
             offset += len(batch)
             if not batch or offset >= total:
                 return out
+
+
+_YEAR_RE = re.compile(r"^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?")
+
+
+def parse_release_year(val):
+    """Extract a 4-digit release year (1800-2100) from a date string or int, else None."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        y = int(val)
+        return y if 1800 <= y <= 2100 else None
+    m = _YEAR_RE.match(str(val).strip())
+    if not m:
+        return None
+    y = int(m.group(1))
+    return y if 1800 <= y <= 2100 else None
+
+
+def parse_mb_date_ts(val):
+    """Parse MusicBrainz / Soulbeet partial dates ('YYYY', 'YYYY-MM', 'YYYY-MM-DD')
+    to UTC unix seconds, or None if missing/unparseable.
+
+    Unlike _parse_ts(), bare 4-digit years ('2025') are parsed as 2025-01-01 rather
+    than 2025 seconds past the Unix epoch.
+    """
+    if val is None or isinstance(val, bool):
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    m = _YEAR_RE.match(s)
+    if not m:
+        return None
+    y = int(m.group(1))
+    if not (1800 <= y <= 2100):
+        return None
+    mo = int(m.group(2)) if m.group(2) else 1
+    d = int(m.group(3)) if m.group(3) else 1
+    try:
+        from datetime import datetime, timezone
+        return int(datetime(y, mo, d, tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        try:
+            from datetime import datetime, timezone
+            return int(datetime(y, min(12, max(1, mo)), 1, tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            return None
+
+
+def recency_priority_bonus(release_date, now=None):
+    """Small priority bonus for releases whose date is known at enqueue time.
+
+    Newer releases rank ahead of older back-catalogue items within the same tier:
+      <= 1 year : +15
+      <= 2 years: +10
+      <= 5 years:  +5
+      <= 10 years: +2
+      older / unknown: 0
+    """
+    rel_ts = parse_mb_date_ts(release_date)
+    if rel_ts is None:
+        return 0
+    now_ts = int(time.time() if now is None else now)
+    age_days = (now_ts - rel_ts) / 86400.0
+    if age_days < 0:
+        age_days = 0.0
+    if age_days <= 365:
+        return 15
+    if age_days <= 730:
+        return 10
+    if age_days <= 5 * 365:
+        return 5
+    if age_days <= 10 * 365:
+        return 2
+    return 0
 
 
 def keep_release_group(rg, cfg):
@@ -1919,12 +2270,26 @@ def sync_favorite_list(state, secrets, exclude_set):
 def sync_one_favorite(state, mb, cfg, name, display, mbid, known_rgs, added_at):
     """Queue an artist's whole discography, and log anything newly released."""
     if not mbid:
-        mbid, note = mb.resolve_mbid(display)
-        if not mbid:
-            log(f"  favorite '{display}': {note}")
-            state.update_favorite(name, last_sync=int(time.time()), note=note)
-            return 0, 0
-        state.update_favorite(name, mbid=mbid, display=note or display, note=None)
+        if hasattr(mb, "resolve_artist_info") and isinstance(mb, MusicBrainz):
+            info, note = mb.resolve_artist_info(display)
+            if not info:
+                log(f"  favorite '{display}': {note}")
+                state.update_favorite(name, last_sync=int(time.time()), note=note)
+                return 0, 0
+            mbid = info["mbid"]
+            mb_name = info.get("name") or display
+            state.update_favorite(name, mbid=mbid, display=mb_name, note=None)
+            state.put_artist_mb(name, mbid, mb_name=mb_name,
+                                ended=info.get("ended", False),
+                                end_year=info.get("end_year"))
+        else:
+            mbid, note = mb.resolve_mbid(display)
+            if not mbid:
+                log(f"  favorite '{display}': {note}")
+                state.update_favorite(name, last_sync=int(time.time()), note=note)
+                return 0, 0
+            state.update_favorite(name, mbid=mbid, display=note or display, note=None)
+            state.put_artist_mb(name, mbid, mb_name=note or display)
 
     rgs = mb.release_groups(mbid)
     if rgs is None:
@@ -1933,19 +2298,23 @@ def sync_one_favorite(state, mb, cfg, name, display, mbid, known_rgs, added_at):
 
     keep = [r for r in rgs if keep_release_group(r, cfg)]
     known = set(known_rgs or [])
+    now = int(time.time())
     added = new_count = 0
     for rg in keep:
         title, rg_id = rg.get("title"), rg.get("id")
         if not title:
             continue
-        if state.add_candidate(display, title, "album", priority=cfg["FAVORITE_PRIORITY"]):
+        released = rg.get("first-release-date") or ""
+        rel_year = parse_release_year(released)
+        prio = cfg["FAVORITE_PRIORITY"] + recency_priority_bonus(released, now=now)
+        if state.add_candidate(display, title, "album", priority=prio, release_year=rel_year):
             added += 1
         # New release = a release-group we've never seen AND dated after you
         # favorited the artist. Without the date check, the very first sync would
         # announce the entire back catalogue as "new".
-        released = rg.get("first-release-date") or ""
+        rel_ts = parse_mb_date_ts(released) or _parse_ts(released)
         if rg_id not in known and known_rgs is not None:
-            if _parse_ts(released) > (added_at or 0):
+            if rel_ts > (added_at or 0):
                 if state.add_new_release(rg_id, display, title, released):
                     log(f"  NEW RELEASE [{display} - {title}] (released {released})")
                     new_count += 1
@@ -1989,6 +2358,191 @@ def favorites_sync(state, secrets, mb, cfg, exclude_set):
     log(f"Favorites: {total_added} candidate(s) queued at priority "
         f"{cfg['FAVORITE_PRIORITY']}, {total_new} new release(s)")
     state.set_meta("last_favorites_sync", int(time.time()))
+
+
+# ----------------------------------------------------------------------------
+# Played-artist new-release watch (MusicBrainz, batched per main-loop pass)
+# ----------------------------------------------------------------------------
+NEW_RELEASE_BATCH_SIZE = 20
+MBID_MISS_RETRY_DAYS = 30
+_NR_ALREADY_DONE_STATUSES = frozenset({"exists", "queued_flac", "queued_alac", "queued_lossy"})
+
+
+def _resolve_artist_mb_cached(state, mb, name, display, cached_mbid, fav_mbid,
+                              resolved_at, now):
+    """Return (mbid, ok_to_continue). Caches hits forever and misses for 30d."""
+    if cached_mbid:
+        return cached_mbid, True
+    if fav_mbid:
+        state.put_artist_mb(name, fav_mbid, mb_name=display, resolved_at=now)
+        return fav_mbid, True
+    # Negative cache: empty string with a recent resolved_at means MB confirmed no match
+    if cached_mbid == "" and resolved_at and (now - resolved_at) < MBID_MISS_RETRY_DAYS * 86400:
+        state.touch_artist_nr_sync(name, ts=now)
+        return None, True
+
+    if hasattr(mb, "resolve_artist_info") and isinstance(mb, MusicBrainz):
+        info, note = mb.resolve_artist_info(display)
+        if info:
+            state.put_artist_mb(name, info["mbid"], mb_name=info.get("name") or display,
+                                ended=info.get("ended", False),
+                                end_year=info.get("end_year"), resolved_at=now)
+            return info["mbid"], True
+    else:
+        mbid, note = mb.resolve_mbid(display)
+        if mbid:
+            state.put_artist_mb(name, mbid, mb_name=note or display, resolved_at=now)
+            return mbid, True
+
+    if note == "lookup failed":
+        return None, False  # transient MB failure; don't negative-cache
+    state.put_artist_mb(name, "", mb_name=display, resolved_at=now,
+                        last_nr_sync=now, note=note)
+    return None, True
+
+
+def sync_one_new_release_artist(state, mb, cfg, name, display, cached_mbid=None,
+                                fav_mbid=None, resolved_at=0, now=None):
+    """Check one watched artist on MusicBrainz for releases within NEW_RELEASE_MAX_AGE_DAYS.
+
+    Returns (found, queued, ok) where `ok` is False only on a transient MB error.
+    Reuses FAVORITE_INCLUDE_* release-type rules via keep_release_group().
+    """
+    now = int(time.time() if now is None else now)
+    mbid, ok = _resolve_artist_mb_cached(
+        state, mb, name, display, cached_mbid, fav_mbid, resolved_at, now)
+    if not ok:
+        return 0, 0, False
+    if not mbid:
+        return 0, 0, True
+
+    rgs = mb.release_groups(mbid)
+    if rgs is None:
+        log(f"  new-release watch '{display}': MusicBrainz lookup failed; will retry")
+        return 0, 0, False
+
+    max_age_sec = int(cfg["NEW_RELEASE_MAX_AGE_DAYS"]) * 86400
+    base_prio = int(cfg["NEW_RELEASE_PRIORITY"])
+    fav_prio = int(cfg.get("FAVORITE_PRIORITY", 100))
+
+    found = queued = 0
+    for rg in rgs:
+        if not keep_release_group(rg, cfg):
+            continue
+        title, rg_id = rg.get("title"), rg.get("id")
+        if not title:
+            continue
+        released = rg.get("first-release-date") or ""
+        rel_ts = parse_mb_date_ts(released)
+        rel_year = parse_release_year(released)
+        bonus = recency_priority_bonus(released, now=now)
+
+        # Skip undated or unreleased far-future announcements (>7d ahead)
+        is_recent = (
+            rel_ts is not None
+            and rel_ts <= now + 7 * 86400
+            and (now - rel_ts) <= max_age_sec
+        )
+        if is_recent:
+            found += 1
+            prio = base_prio + bonus
+            # Never let a non-favorite new release accidentally qualify as a favorite
+            # during favorites_only cap bypass.
+            if fav_prio > base_prio:
+                prio = min(prio, fav_prio - 1)
+            if _album_in_library(state, display, title):
+                continue
+            key = f"{norm(display)}|{norm(title)}|album"
+            existing = state.candidate_info(key)
+            if existing and existing[2] in _NR_ALREADY_DONE_STATUSES:
+                continue
+            prev_prio = state.candidate_priority(key) if existing else None
+            is_new = state.add_candidate(display, title, "album",
+                                         priority=prio, release_year=rel_year)
+            promoted = (
+                not is_new
+                and existing is not None
+                and existing[2] == "pending"
+                and (prev_prio is None or prio > prev_prio)
+            )
+            if is_new or promoted:
+                queued += 1
+                if rg_id and state.add_new_release(rg_id, display, title, released):
+                    log(f"  NEW RELEASE [{display} - {title}] (released {released})")
+        elif bonus > 0:
+            # Already have the release date in memory: gently prioritize existing
+            # pending Last.fm candidates from the last decade (zero extra API calls).
+            state.promote_pending_candidate(display, title, "album",
+                                            priority=bonus, release_year=rel_year)
+
+    state.touch_artist_nr_sync(name, ts=now)
+    return found, queued, True
+
+
+def new_releases_sync_step(state, mb, lastfm, cfg, exclude_set,
+                           batch_size=NEW_RELEASE_BATCH_SIZE, now=None):
+    """Incrementally sync up to `batch_size` due top-played artists on MusicBrainz.
+
+    Spreading work across main-loop passes respects MusicBrainz's 1 req/s limit
+    without stalling downloads for 10+ minutes.
+    """
+    top_n = int(cfg.get("NEW_RELEASE_TOP_ARTISTS", 500) or 0)
+    if top_n <= 0:
+        return {"checked": 0, "due": 0, "found": 0, "queued": 0}
+    now = int(time.time() if now is None else now)
+    sync_cutoff = now - int(cfg.get("NEW_RELEASE_SYNC_HOURS", 24)) * 3600
+
+    watched = state.top_watched_artists(
+        limit=top_n, exclude_favorites=bool(cfg.get("FAVORITES_ENABLED", True)))
+    due = [r for r in watched if (r[7] or 0) < sync_cutoff]
+    if not due:
+        return {"checked": 0, "due": 0, "found": 0, "queued": 0}
+
+    checked = skipped = found = queued = consec_fail = 0
+    for (name, display, _w, _pw, cached_mbid, _mb_name, resolved_at, _last_sync, fav_mbid) in due:
+        if checked >= batch_size:
+            break
+        if is_kids_artist(state, lastfm, display, exclude_set):
+            state.touch_artist_nr_sync(name, ts=now)
+            skipped += 1
+            continue
+        try:
+            f, q, ok = sync_one_new_release_artist(
+                state, mb, cfg, name, display,
+                cached_mbid=cached_mbid, fav_mbid=fav_mbid,
+                resolved_at=resolved_at, now=now,
+            )
+        except Exception as e:
+            log(f"  new-release watch '{display}' error: {e}")
+            f, q, ok = 0, 0, False
+        checked += 1
+        found += f
+        queued += q
+        if ok:
+            consec_fail = 0
+        else:
+            consec_fail += 1
+            if consec_fail >= 3:
+                log("New releases: 3 consecutive MusicBrainz failures; pausing batch")
+                break
+
+    remaining = max(0, len(due) - checked - skipped)
+    summary = {
+        "ts": now,
+        "checked": checked,
+        "skipped": skipped,
+        "due": remaining,
+        "found": found,
+        "queued": queued,
+    }
+    state.set_meta("last_new_release_sync", now)
+    state.set_meta("last_new_release_summary", json.dumps(summary))
+    if checked or skipped:
+        log(f"New releases: checked {checked} artist(s) ({remaining} due"
+            + (f", {skipped} excluded" if skipped else "")
+            + f"), {found} recent release(s) found, {queued} queued/promoted "
+              f"at priority {cfg['NEW_RELEASE_PRIORITY']}+")
+    return summary
 
 
 # ----------------------------------------------------------------------------
@@ -2148,6 +2702,54 @@ def free_gb(path):
         return float("inf")
 
 
+MAX_SIMILAR_DEPTH = 2
+_SHORT_DECADE_END = {
+    "50s": 1959, "60s": 1969, "70s": 1979, "80s": 1989, "90s": 1999, "00s": 2009,
+}
+_LONG_DECADE_RE = re.compile(r"^(19[2-9]0|20[0-2]0)s$")
+
+
+def is_inactive_explore_artist(state, artist, max_inactive_years, now=None):
+    """Cheaply detect clearly old/ended artists using ONLY already-cached state.
+
+    Returns True when:
+      1. Cached MusicBrainz life-span (artist_mb) shows the artist ended before
+         (current_year - max_inactive_years), OR
+      2. Cached Last.fm tags (artist_tags) contain decade tags and the latest
+         decade ended before (current_year - max_inactive_years), OR top tags
+         include 'oldies' with no recent decade tag.
+
+    Makes zero network calls. Unknown/uncached artists return False.
+    """
+    max_years = int(max_inactive_years or 0)
+    if max_years <= 0:
+        return False
+    cur_year = time.gmtime(now).tm_year if now is not None else time.gmtime().tm_year
+    cutoff_year = cur_year - max_years
+
+    mb_info = state.get_artist_mb(artist)
+    if mb_info and mb_info.get("ended") and mb_info.get("end_year"):
+        if int(mb_info["end_year"]) < cutoff_year:
+            return True
+
+    tags = state.get_tags(artist)
+    if tags:
+        decade_ends = []
+        for t in tags[:15]:
+            tl = (t or "").strip().lower()
+            if tl in _SHORT_DECADE_END:
+                decade_ends.append(_SHORT_DECADE_END[tl])
+            else:
+                m = _LONG_DECADE_RE.match(tl)
+                if m:
+                    decade_ends.append(int(m.group(1)) + 9)
+        if decade_ends:
+            return max(decade_ends) < cutoff_year
+        if "oldies" in {((t or "").strip().lower()) for t in tags[:6]}:
+            return True
+    return False
+
+
 # ----------------------------------------------------------------------------
 # Core: expand seed graph, process candidates
 # ----------------------------------------------------------------------------
@@ -2159,14 +2761,15 @@ def refresh_taste(state, secrets, lastfm, exclude_set, cfg):
       YouTube Music history (the cold-start signal, from Takeout).
     """
     hl = cfg["TASTE_HALF_LIFE_DAYS"]
-    weights = {}
+    played_weights = {}
     user, pw = secrets["SOULBEET_USER"], secrets["SOULBEET_PASS"]
     for name, w in navidrome_play_weights(user, pw, hl).items():
-        weights[name] = weights.get(name, 0) + w * cfg["WEIGHT_NAVIDROME"]
+        played_weights[name] = played_weights.get(name, 0) + w * cfg["WEIGHT_NAVIDROME"]
     for name, w in tautulli_play_weights(secrets.get("TAUTULLI_API_KEY"), hl).items():
-        weights[name] = weights.get(name, 0) + w * cfg["WEIGHT_PLEX"]
+        played_weights[name] = played_weights.get(name, 0) + w * cfg["WEIGHT_PLEX"]
     for name, w in youtube_music_weights(hl).items():
-        weights[name] = weights.get(name, 0) + w * cfg["WEIGHT_YTMUSIC"]
+        played_weights[name] = played_weights.get(name, 0) + w * cfg["WEIGHT_YTMUSIC"]
+    weights = dict(played_weights)
     # ensure existing library artists are at least seeded (weight 1) so we always have a base
     for name in navidrome_all_artists(user, pw):
         weights.setdefault(name, 1.0)
@@ -2181,14 +2784,16 @@ def refresh_taste(state, secrets, lastfm, exclude_set, cfg):
         if is_excluded_by_name(name, exclude_set):
             skipped += 1
             continue
-        state.upsert_artist(name, weight=w)
+        state.upsert_artist(name, weight=w, depth=0,
+                            play_weight=played_weights.get(name, 0.0))
         added += 1
+    state.sync_pending_artist_weights()
     log(f"Taste refresh: {added} weighted artists seeded, {skipped} blocklisted "
         f"(top play counts drive expansion)")
     state.set_meta("last_taste_refresh", int(time.time()))
 
 
-def expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set):
+def expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set, depth=0):
     """Generate album candidates for one artist: exploitation + a share of exploration.
 
     This is where the kids filter actually bites: seeding is cheap and unfiltered
@@ -2199,24 +2804,38 @@ def expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set):
         log(f"  excluded (kids): {artist}")
         state.mark_expanded(artist)
         return 0
+    max_inactive = cfg.get("EXPLORE_MAX_INACTIVE_YEARS", 15)
+    # Artists that only arrived via tag exploration or deep propagation (>=2 hops):
+    # now that is_kids_artist() has cached their Last.fm tags, skip clearly old ones.
+    if depth >= MAX_SIMILAR_DEPTH and is_inactive_explore_artist(state, artist, max_inactive):
+        log(f"  excluded (inactive explore): {artist}")
+        state.mark_expanded(artist)
+        return 0
     new = 0
     # exploitation: this artist's own top albums + similar artists' top albums
     for alb in lastfm.top_albums(artist, limit=8):
-        if state.add_candidate(artist, alb, "album"):
+        if state.add_candidate(artist, alb, "album", artist_weight=weight):
             new += 1
-    for sim in lastfm.similar(artist, limit=25):
-        # cheap name check only; the tag check happens when sim is itself expanded
-        if not is_excluded_by_name(sim, exclude_set):
-            state.upsert_artist(sim, weight=weight * 0.5)  # propagate taste weight
+    # Cap similar-artist propagation depth so the graph doesn't drift 5+ hops away
+    # from the user's actual listening into classic/generic acts.
+    if depth < MAX_SIMILAR_DEPTH:
+        for sim in lastfm.similar(artist, limit=25):
+            # cheap name check only; the tag check happens when sim is itself expanded
+            if not is_excluded_by_name(sim, exclude_set):
+                state.upsert_artist(sim, weight=weight * 0.5, depth=depth + 1)
 
-    # exploration: from this artist's primary tags, pull artists we don't own
-    if cfg["EXPLORE_RATIO"] > 0:
+    # exploration: from direct taste seeds' primary tags, pull artists we don't own
+    if cfg["EXPLORE_RATIO"] > 0 and depth == 0:
         for tag in (state.get_tags(artist) or [])[:2]:
             if tag in KIDS_TAGS:
                 continue
             for exp_artist in lastfm.tag_top_artists(tag, limit=int(15 * cfg["EXPLORE_RATIO"]) + 3):
-                if not is_excluded_by_name(exp_artist, exclude_set):
-                    state.upsert_artist(exp_artist, weight=weight * 0.2)
+                if is_excluded_by_name(exp_artist, exclude_set):
+                    continue
+                if is_inactive_explore_artist(state, exp_artist, max_inactive):
+                    continue
+                state.upsert_artist(exp_artist, weight=weight * 0.2,
+                                    depth=MAX_SIMILAR_DEPTH)
     state.mark_expanded(artist)
     return new
 
@@ -2238,6 +2857,9 @@ def process_candidate(state, sb, secrets, row, backend_down=None, cfg=None):
         results = sb.search_album(artist, album or artist)
         if results:
             album_obj = results[0]
+            rel_year = parse_release_year(album_obj.get("release_date"))
+            if rel_year is not None and hasattr(state, "set_candidate_release_year"):
+                state.set_candidate_release_year(key, rel_year)
         else:
             tr = sb.search_track(artist, album or artist)
             if not tr:
@@ -2788,6 +3410,15 @@ def write_status(state, cfg, lib_bytes, track_count, free):
         {"artist": a, "album": b, "released": rel, "found_at": f}
         for (a, b, rel, f) in state.recent_new_releases(10)
     ]
+    try:
+        status["new_release_watch"] = state.new_release_watch_stats(
+            top_n=cfg.get("NEW_RELEASE_TOP_ARTISTS", 500),
+            sync_hours=cfg.get("NEW_RELEASE_SYNC_HOURS", 24),
+            exclude_favorites=bool(cfg.get("FAVORITES_ENABLED", True)),
+        )
+    except Exception as e:
+        log(f"new release watch status failed (non-fatal): {e}")
+        status["new_release_watch"] = None
     status["favorites"] = [
         {"artist": display or name, "source": src, "mbid": mbid,
          "albums_total": at or 0, "albums_have": ah or 0,
@@ -2990,13 +3621,20 @@ def main():
                 time.time() - last_fav > cfg["FAVORITE_SYNC_HOURS"] * 3600:
             favorites_sync(state, secrets, mb, cfg, exclude_set)
 
+        # incrementally check top played artists for recent releases (batched)
+        if not favorites_only:
+            try:
+                new_releases_sync_step(state, mb, lastfm, cfg, exclude_set)
+            except Exception as e:
+                log(f"new-release watch error (non-fatal): {e}")
+
         # periodically re-queue old errored candidates (respects priority)
         maybe_requeue_errors(state, cfg)
 
         if not favorites_only:
             # expand a few top-weighted artists into album candidates
-            for artist, weight in state.unexpanded_artists(limit=5):
-                expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set)
+            for artist, weight, depth in state.unexpanded_artists(limit=5):
+                expand_one_artist(state, lastfm, artist, weight, cfg, exclude_set, depth=depth)
 
         # process a wave of pending candidates concurrently
         if favorites_only:
